@@ -265,4 +265,15 @@ assert.strictEqual(cleanHit("Dr Priya Nair."), "Priya Nair");
   assert.strictEqual(r.apply("Line one of the report."), "Line one of the report.");
   assert.strictEqual(r.apply("Please ask Priya about it."), "Please ask [NAME] about it.");
 }
+// --- spreadsheet header detection (title rows above the real header)
+{
+  const { findHeaderRow, headerType } = await import("../js/handlers.js");
+  assert.strictEqual(findHeaderRow([["Quarterly client report"], [""], ["Client Name", "Mobile", "Amount"], ["Anita", "98", "1"]]), 2);
+  assert.strictEqual(findHeaderRow([["Client Name", "Mobile"], ["a", "b"]]), 0);
+  assert.strictEqual(findHeaderRow([["x", "y"], ["a", "b"]]), 0, "no recognisable header: fall back to row 0");
+  assert.strictEqual(findHeaderRow([]), 0);
+  for (const [h, t] of [["Demat No", "DEMAT"], ["Account Number", "ACCOUNT"], ["Folio", "FOLIO"], ["PAN", "ID"], ["Password", "SECRET"], ["E-mail", "EMAIL"], ["Date of Birth", "DATE"]])
+    assert.strictEqual(headerType(h), t, h);
+  for (const h of ["Amount", "Units", "Scheme Name", "Company name", "Notes", "File name"]) assert.strictEqual(headerType(h), null, h);
+}
 console.log("All unit tests passed.");

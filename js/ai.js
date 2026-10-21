@@ -112,7 +112,14 @@ export function defaultPoolSize() {
  * kinds: person, address, account, id, secret, pii.
  */
 export async function loadDetector(onDownloadProgress, size = defaultPoolSize()) {
-  const sessions = await Promise.all(Array.from({ length: size }, () => openSession(onDownloadProgress)));
+  const opened = await Promise.allSettled(Array.from({ length: size }, () => openSession(onDownloadProgress)));
+  const sessions = opened.filter((o) => o.status === "fulfilled").map((o) => o.value);
+  const failed = opened.find((o) => o.status === "rejected");
+  if (failed) {
+    // Do not leave the workers that did start running in the background.
+    await Promise.allSettled(sessions.map((x) => x.close()));
+    throw failed.reason;
+  }
   const idle = [...sessions];
   const waiting = [];
   const acquire = () => (idle.length ? Promise.resolve(idle.pop()) : new Promise((resolve) => waiting.push(resolve)));

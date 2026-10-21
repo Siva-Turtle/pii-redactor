@@ -116,3 +116,32 @@ writeFileSync(dir + "finance.txt", [
   }
   writeFileSync(dir + "multi.pdf", await mp.save());
 }
+
+// ---- bug-hunt fixtures
+{
+  const { degrees } = require("pdf-lib");
+  const rp = await PDFDocument.create();
+  const rf = await rp.embedFont(StandardFonts.Helvetica);
+  const pg = rp.addPage([400, 400]);
+  pg.drawText("Normal line mail top@example.com", { x: 40, y: 340, size: 12, font: rf });
+  pg.drawText("Rotated PAN ABCDE1234F here", { x: 330, y: 60, size: 12, font: rf, rotate: degrees(90) });
+  const rotatedPage = rp.addPage([400, 300]); rotatedPage.setRotation(degrees(90));
+  rotatedPage.drawText("Page rotated attr phone +91 98765 43210", { x: 30, y: 150, size: 12, font: rf });
+  writeFileSync(dir + "rotated.pdf", await rp.save());
+
+  const wbT = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wbT, XLSX.utils.aoa_to_sheet([
+    ["Quarterly client report"], [""],
+    ["Client Name", "Mobile", "Amount"],
+    ["Anita Desai", 9876543210, 1500],
+    ["Vikram Rathore", 9123456780, 2500],
+  ]), "Report");
+  XLSX.writeFile(wbT, dir + "titlerow.xlsx");
+  XLSX.writeFile(wbT, dir + "legacy.xls", { bookType: "biff8" });
+
+  writeFileSync(dir + "empty.txt", "");
+  writeFileSync(dir + "blank.txt", "   \n\n  ");
+  writeFileSync(dir + "bad.docx", Buffer.from("this is not a zip file at all"));
+  writeFileSync(dir + "UPPER.TXT", "Mail me: shout@example.com");
+  writeFileSync(dir + "old.doc", Buffer.from("legacy"));
+}

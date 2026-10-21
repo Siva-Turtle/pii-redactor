@@ -2,7 +2,11 @@ import { loadDetector } from "./ai.js";
 import { Redactor, parseManual } from "./redactor.js";
 import { SUPPORTED, extOf, redactFile } from "./handlers.js";
 
+window.__appLoaded = true;
 const $ = (id) => document.getElementById(id);
+// js/guard.js may have shown a "browser can't start" message if loading was slow.
+$("banner").hidden = true;
+$("drop").hidden = false;
 const LABELS = {
   NAME: "name", ADDRESS: "address", EMAIL: "email", UPI: "UPI ID", PHONE: "phone number", PAN: "PAN",
   AADHAAR: "Aadhaar", SSN: "SSN", CARD: "card number", IFSC: "IFSC", GSTIN: "GSTIN", ACCOUNT: "account number",
@@ -18,13 +22,6 @@ let queue = Promise.resolve();
 function showBanner(id, text) {
   $(id).textContent = text;
   $(id).hidden = !text;
-}
-
-if (location.protocol === "file:") {
-  showBanner(
-    "banner",
-    "This page needs to be opened with the start file. Close this tab and double-click “Start” (Windows: Start-Windows.bat, Mac: Start-Mac.command) in the folder.",
-  );
 }
 
 function getDetector() {

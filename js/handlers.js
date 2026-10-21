@@ -42,6 +42,17 @@ export function headerType(header) {
   return null;
 }
 
+// Reports often start with a title or blank rows above the real headers. The
+// header row is the first of the top rows that has 2+ filled cells, at least one
+// of them a recognisable header; otherwise row 0.
+export function findHeaderRow(rows) {
+  for (let r = 0; r < Math.min(rows.length, 15); r++) {
+    const cells = rows[r].map((c) => String(c ?? "").trim());
+    if (cells.filter(Boolean).length >= 2 && cells.some((c) => headerType(c))) return r;
+  }
+  return 0;
+}
+
 async function learnWithBudget(redactor, texts, status, warnings) {
   if (!redactor.detector) return;
   const r = await redactor.learn(texts, {
@@ -76,18 +87,20 @@ async function redactCsv(file, redactor, status) {
   const delimiter = detectDelimiter(text);
   const rows = parseCsv(text, delimiter);
   const warnings = [];
-  const hidden = (rows[0] || []).map(headerType);
+  const headRow = findHeaderRow(rows);
+  const hidden = (rows[headRow] || []).map(headerType);
 
   const rowText = (row) =>
     row.filter((cell, c) => !hidden[c] && /\p{L}{3,}/u.test(cell)).join(" | ");
-  await learnWithBudget(redactor, rows.slice(1).map(rowText), status, warnings);
+  await learnWithBudget(redactor, rows.map((row, r) => (r === headRow ? "" : rowText(row))), status, warnings);
 
+  // Rows above the header are titles: they still go through the patterns/AI.
   const out = rows.map((row, r) =>
-    r === 0
+    r === headRow
       ? row
-      : row.map((cell, c) => (hidden[c] ? redactor.hideAs(hidden[c], cell) : redactor.apply(cell))),
+      : row.map((cell, c) => (r > headRow && hidden[c] ? redactor.hideAs(hidden[c], cell) : redactor.apply(cell))),
   );
-  const hiddenCols = (rows[0] || []).filter((_, c) => hidden[c]);
+  const hiddenCols = (rows[headRow] || []).filter((_, c) => hidden[c]);
   if (hiddenCols.length) warnings.push(`Hid whole columns: ${hiddenCols.join(", ")}.`);
   return {
     blob: new Blob([bom + stringifyCsv(out, delimiter, eol)], { type: "text/csv" }),
@@ -107,11 +120,19 @@ async function redactXlsx(file, redactor, status) {
     const sheet = wb.Sheets[sheetName];
     if (!sheet || !sheet["!ref"]) continue;
     const range = XLSX.utils.decode_range(sheet["!ref"]);
-    const hidden = {};
-    for (let c = range.s.c; c <= range.e.c; c++) {
-      const head = sheet[XLSX.utils.encode_cell({ r: range.s.r, c })];
-      hidden[c] = head ? headerType(head.w ?? head.v) : null;
+    const textAt = (r, c) => {
+      const cell = sheet[XLSX.utils.encode_cell({ r, c })];
+      return cell ? String(cell.w ?? cell.v ?? "") : "";
+    };
+    const grid = [];
+    for (let r = range.s.r; r <= Math.min(range.e.r, range.s.r + 14); r++) {
+      const row = [];
+      for (let c = range.s.c; c <= range.e.c; c++) row.push(textAt(r, c));
+      grid.push(row);
     }
+    const headR = range.s.r + findHeaderRow(grid);
+    const hidden = {};
+    for (let c = range.s.c; c <= range.e.c; c++) hidden[c] = headerType(textAt(headR, c));
     for (let r = range.s.r; r <= range.e.r; r++) {
       const rowBits = [];
       for (let c = range.s.c; c <= range.e.c; c++) {
@@ -119,9 +140,9 @@ async function redactXlsx(file, redactor, status) {
         const cell = sheet[addr];
         if (!cell) continue;
         const asText = String(cell.w ?? cell.v ?? "");
-        const isHeaderRow = r === range.s.r;
-        plan.push({ cell, asText, hidden: isHeaderRow ? null : hidden[c], isHeaderRow });
-        if (!isHeaderRow && !hidden[c] && /\p{L}{3,}/u.test(asText)) rowBits.push(asText);
+        const isHeaderRow = r === headR;
+        plan.push({ cell, asText, hidden: r > headR ? hidden[c] : null, isHeaderRow });
+        if (!isHeaderRow && !(r > headR && hidden[c]) && /\p{L}{3,}/u.test(asText)) rowBits.push(asText);
         if (cell.c) delete cell.c; // cell comments can hold names
         if (cell.l) delete cell.l; // hyperlinks can hold mailto: addresses
       }
@@ -131,7 +152,7 @@ async function redactXlsx(file, redactor, status) {
     if (hiddenCols.length)
       warnings.push(
         `Sheet "${sheetName}": hid whole columns ` +
-          hiddenCols.map(([c]) => sheet[XLSX.utils.encode_cell({ r: range.s.r, c: +c })]?.w).join(", ") +
+          hiddenCols.map(([c]) => textAt(headR, +c)).join(", ") +
           ".",
       );
   }
@@ -326,7 +347,7 @@ async function redactPdf(file, redactor, status) {
   }
   const chars = pages.reduce((n, p) => n + p.text.replace(/\s/g, "").length, 0);
   if (chars < 20) {
-    throw new Error(
+    throw new FriendlyError(
       "This PDF looks like a scan (a picture of a page), so there is no text to find. " +
         "Run it through OCR first, then try again.",
     );
@@ -394,23 +415,39 @@ async function redactPdf(file, redactor, status) {
 }
 
 // ------------------------------------------------------------------- entry
+class FriendlyError extends Error {}
+
+function friendly(err, ext) {
+  if (err instanceof FriendlyError) return err;
+  const text = `${err?.name || ""} ${err?.message || ""}`;
+  if (/password/i.test(text))
+    return new FriendlyError("This file is protected with a password. Remove the password first, then try again.");
+  const kind = { pdf: "PDF", docx: "Word", xlsx: "Excel", xls: "Excel" }[ext];
+  if (kind && /zip|corrupt|invalid|unexpected|not a|signature|central directory|format|parse|header|xref|stream/i.test(text))
+    return new FriendlyError(`This doesn't look like a valid ${kind} file, or it is damaged. Try opening and re-saving it, then drop it in again.`);
+  return err;
+}
 export async function redactFile(file, redactor, status) {
   redactor.resetFile();
   const ext = extOf(file.name);
-  switch (ext) {
-    case "txt":
-    case "md":
-      return redactText(file, redactor, status, ext);
-    case "csv":
-      return redactCsv(file, redactor, status);
-    case "xlsx":
-    case "xls":
-      return redactXlsx(file, redactor, status);
-    case "docx":
-      return redactDocx(file, redactor, status);
-    case "pdf":
-      return redactPdf(file, redactor, status);
-    default:
-      throw new Error(`.${ext} files are not supported. Try PDF, Word (.docx), Excel, CSV, text or Markdown.`);
+  try {
+    switch (ext) {
+      case "txt":
+      case "md":
+        return await redactText(file, redactor, status, ext);
+      case "csv":
+        return await redactCsv(file, redactor, status);
+      case "xlsx":
+      case "xls":
+        return await redactXlsx(file, redactor, status);
+      case "docx":
+        return await redactDocx(file, redactor, status);
+      case "pdf":
+        return await redactPdf(file, redactor, status);
+      default:
+        throw new FriendlyError(`.${ext} files are not supported. Try PDF, Word (.docx), Excel, CSV, text or Markdown.`);
+    }
+  } catch (err) {
+    throw friendly(err, ext);
   }
 }

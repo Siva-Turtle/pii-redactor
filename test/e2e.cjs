@@ -13,6 +13,7 @@ const fx = path.join(__dirname, "fixtures"), out = path.join(__dirname, "out");
   await p.goto(url);
   const names = process.argv.slice(3).length ? process.argv.slice(3) : ["sample.txt","sample.md","sample.csv","sample.xlsx","sample.docx","sample.pdf","scan-like.pdf"];
   if (process.env.MANUAL) await p.fill("#optManual", process.env.MANUAL);
+  if (process.env.NOAI) await p.uncheck("#optAi");
   await p.setInputFiles("#picker", names.map((n) => path.join(fx, n)));
   await p.waitForFunction((n) => [...document.querySelectorAll(".file .state")].filter((s) => /^(Done|Could not|Not supported)/.test(s.textContent)).length === n, names.length, { timeout: 1800000 });
   await p.screenshot({ path: path.join(out, "page.png"), fullPage: true });
