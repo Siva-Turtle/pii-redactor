@@ -40,6 +40,9 @@
   summary { cursor: pointer; }
   .opts { display: grid; gap: 8px; margin-top: 10px; color: var(--ink); }
   .opts label { display: flex; gap: 10px; align-items: flex-start; }
+  .opts label.stack { flex-direction: column; gap: 6px; }
+  textarea { width: 100%; font: inherit; padding: 8px 10px; border-radius: 10px; border: 1px solid var(--line);
+    background: var(--card); color: var(--ink); resize: vertical; }
   .opts small { color: var(--muted); display: block; }
   ul#files { list-style: none; padding: 0; margin: 20px 0 0; display: grid; gap: 12px; }
   .file { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 14px 16px; }
@@ -75,9 +78,11 @@
     <span>PDF · Word · Excel · CSV · Text · Markdown</span>
   </label>
 
-  <details>
+  <details open>
     <summary>Options</summary>
     <div class="opts">
+      <label class="stack"><span>Always hide these exact words or lines <small>Optional. Separate with commas, e.g. <em>Project Falcon, Acme Wealth Pvt Ltd, Site 7</em>. Capital letters and extra spaces don't matter.</small></span>
+        <textarea id="optManual" rows="2" spellcheck="false" placeholder="Project Falcon, Acme Wealth Pvt Ltd"></textarea></label>
       <label><input id="optAi" type="checkbox" checked>
         <span>Also find names, addresses and other private details with the built-in AI <small>Recommended. Runs on this computer. Slower, but catches things that have no fixed format.</small></span></label>
       <label><input id="optThorough" type="checkbox" checked>

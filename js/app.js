@@ -1,12 +1,12 @@
 import { loadDetector } from "./ai.js";
-import { Redactor } from "./redactor.js";
+import { Redactor, parseManual } from "./redactor.js";
 import { SUPPORTED, extOf, redactFile } from "./handlers.js";
 
 const $ = (id) => document.getElementById(id);
 const LABELS = {
   NAME: "name", ADDRESS: "address", EMAIL: "email", UPI: "UPI ID", PHONE: "phone number", PAN: "PAN",
   AADHAAR: "Aadhaar", SSN: "SSN", CARD: "card number", IFSC: "IFSC", GSTIN: "GSTIN", ACCOUNT: "account number",
-  DATE: "date", IP: "IP address", ID: "ID number", DEMAT: "demat account", FOLIO: "folio number",
+  DATE: "date", IP: "IP address", ID: "ID number", CUSTOM: "item from your list", PII: "other private detail", DEMAT: "demat account", FOLIO: "folio number",
   POLICY: "policy/UAN/PRAN number", SECRET: "password/PIN/OTP", TAN: "TAN",
 };
 const plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
@@ -104,7 +104,7 @@ async function processFile(file) {
       card.state("Getting the AI ready (first time only)…");
       detector = await getDetector();
     }
-    const redactor = new Redactor({ dates: $("optDates").checked, thorough: $("optThorough").checked, detector });
+    const redactor = new Redactor({ dates: $("optDates").checked, thorough: $("optThorough").checked, manual: parseManual($("optManual").value), detector });
     const status = (text) => {
       card.state(text);
       const m = text.match(/(\d+) of (\d+)/);

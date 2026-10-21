@@ -91,7 +91,7 @@ export const RULES = [
 ];
 
 export function labelFor(type) {
-  return `[${type}]`;
+  return type === "CUSTOM" ? "[REDACTED]" : `[${type}]`;
 }
 
 /**

@@ -56,10 +56,15 @@ Two layers work together, and both are local:
      lowercase phrases are ignored).
    - Everything found is then hidden **everywhere** in that file. Cheap deterministic name cues also work with the
      AI off: `Mr./Dr. X`, `Dear X`, `Regards, X`, `spouse X`, `Name: X`.
-   - **Speed:** thorough mode costs roughly 10 seconds per paragraph (about 2 minutes for a dozen lines on a
-     laptop CPU), so the AI pass is time-boxed to 10 minutes per file and you are told if it ran out. *Options →
-     Thorough check* can be unticked for a single quicker pass.
-3. **Spreadsheets/CSV:** columns whose header says *name, email, phone, DOB, address, PAN, Aadhaar, account,
+   - **Speed:** Needle runs in one worker per CPU core (up to 6), and every question for every sentence is
+     queued across them. Measured: asking N questions at once costs the same as asking one, so the finance sample
+     (12 lines, 81 model calls) takes ~33 s on a 4-core machine, down from 137 s with two workers. The AI pass is
+     time-boxed to 10 minutes per file, and you are told if it ran out. *Options → Thorough check* can be unticked
+     for a single, quicker pass. Sentences with nothing worth asking about (no names, digits or `@`) are skipped.
+3. **Your own list.** *Options → "Always hide these exact words or lines"* takes comma-separated items such as
+   `Project Falcon, Acme Wealth Pvt Ltd`. They are hidden everywhere, ignoring capitals and extra spaces, and
+   win over every other rule. They show up as `[REDACTED]`.
+4. **Spreadsheets/CSV:** columns whose header says *name, email, phone, DOB, address, PAN, Aadhaar, account,
    demat, folio, policy, password…* are hidden whole; other cells go through the two layers above.
 
 | File | What you get back |

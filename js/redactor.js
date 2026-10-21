@@ -17,6 +17,10 @@ const CHUNK_MAX = 200;
 const CHUNK_MERGE = 30;
 const MAX_RUNS = 12; // hard cap on Needle runs per chunk
 const EMPTY_RUNS_TO_STOP = 2; // stop after this many consecutive runs that find nothing new
+// Words that merely open a sentence; a capital letter on them says nothing.
+const STARTERS = new Set(
+  ("the this that these those there then they their them please kindly our your you his her with from for and but however also any all can could will would should what when where how why which who are was were has have had not its into over under after before about as at by if in is it of on or so to we").split(" "),
+);
 const TITLES = /^(?:mr|mrs|ms|miss|dr|shri|smt|sri|prof|mx)$/i;
 const CORPORATE = /\b(?:pvt|ltd|limited|bank|inc|llc|llp|corp|wealth|capital|finance|fund|trust|services|technologies|solutions|group|company|co|insurance|securities|partners)\b/i;
 const ADDRESS_HINT =
@@ -84,9 +88,23 @@ function inferKind(hit) {
   return titleCase && !CORPORATE.test(hit) ? "NAME" : null;
 }
 
+/** Turn the user's own list (exact words or lines) into one matcher; matching ignores case and extra spaces. */
+export function buildManual(items) {
+  const list = [...new Set(items.map((x) => x.replace(/\s+/g, " ").trim()).filter((x) => x.length >= 2))].sort((a, b) => b.length - a.length);
+  if (!list.length) return null;
+  const body = list.map((x) => `${/^[\p{L}\p{N}]/u.test(x) ? "(?<![\\p{L}\\p{N}])" : ""}${wsRe(x)}${/[\p{L}\p{N}]$/u.test(x) ? "(?![\\p{L}\\p{N}])" : ""}`).join("|");
+  return new RegExp(body, "giu");
+}
+
+/** Split what the user typed into items: commas and line breaks both separate. */
+export function parseManual(text) {
+  return String(text || "").split(/[,\n]/).map((x) => x.trim()).filter(Boolean);
+}
+
 export class Redactor {
-  constructor({ dates = true, detector = null, thorough = true } = {}) {
+  constructor({ dates = true, detector = null, thorough = true, manual = [] } = {}) {
     this.dates = dates;
+    this.manual = buildManual(manual);
     // Thorough: keep asking until nothing new turns up in two runs in a row. Quick: one.
     this.emptyRunsToStop = thorough ? EMPTY_RUNS_TO_STOP : 1;
     this.detector = detector;
@@ -124,13 +142,18 @@ export class Redactor {
     const list = [...chunks.keys()];
     const total = Math.min(list.length, maxChunks);
     const started = Date.now();
-    let scanned = 0;
-    for (let i = 0; i < total && Date.now() - started < maxMs; i++) {
-      await this._scanChunk(list[i]);
-      scanned = i + 1;
-      onProgress?.(scanned, total);
-    }
-    return { scanned, total: list.length, truncated: scanned < list.length };
+    let next = 0;
+    let done = 0;
+    // One chunk per Needle session at a time; each chunk fires all its questions at once.
+    const lane = async () => {
+      while (next < total && Date.now() - started < maxMs) {
+        await this._scanChunk(list[next++]);
+        done++;
+        onProgress?.(done, total);
+      }
+    };
+    await Promise.all(Array.from({ length: Math.max(1, Math.min(this.detector.size || 1, total)) }, lane));
+    return { scanned: done, total: list.length, truncated: done < list.length };
   }
 
   /** Deterministic name cues: titles, greetings, sign-offs, relations, "Name:" labels. */
@@ -183,38 +206,34 @@ export class Redactor {
     }
   }
 
-  /** One run: every relevant question, once, spread over the two Needle sessions. */
+  /** One run: every relevant question, once, all at the same time (the pool queues them). */
   async _askAll(text, variant) {
     const d = this.detector;
     const rest = applySpans(text, findPatternSpans(text, { dates: true }), () => " ").replace(/_/g, " ");
+    // Capitalised words that are not just a sentence opener such as "The" or "Please".
+    const capital = (rest.match(/\p{Lu}\p{L}{2,}/gu) || []).some((w) => !STARTERS.has(w.toLowerCase()));
     const want = {
-      person: /\p{Lu}\p{L}{2,}/u.test(rest),
+      person: capital,
       address: ADDRESS_HINT.test(rest),
       // A digit-bearing token the patterns did not already claim.
       account: /\b[A-Za-z]*\d[\dA-Za-z/-]{3,}/.test(rest),
       secret: /(?:pass\w*|pwd|\bpw\b|\bpin\b|otp|cvv|cvc|login|user ?(?:name|id)|credential|secret)\W+\w{3,}/i.test(rest),
-      pii: /\p{L}{3,}/u.test(rest),
+      pii: capital || /\d|@/.test(rest),
     };
     want.id = want.account;
     const KIND = { person: "NAME", address: "ADDRESS", account: "ACCOUNT", id: "ID", secret: "SECRET", pii: "PII" };
-    const lanes = [
-      ["person", "secret", "pii"], // Needle session 1
-      ["address", "account", "id"], // Needle session 2
-    ];
     const out = [];
     await Promise.all(
-      lanes.map(async (lane) => {
-        for (const q of lane) {
-          if (!want[q]) continue;
-          let raw = null;
+      Object.keys(KIND)
+        .filter((q) => want[q])
+        .map(async (q) => {
           try {
-            raw = await d.find(q, text, variant);
+            const raw = await d.find(q, text, variant);
+            if (raw) out.push({ raw, kind: KIND[q] });
           } catch {
-            continue;
+            /* one failed question must not lose the others */
           }
-          if (raw) out.push({ raw, kind: KIND[q] });
-        }
-      }),
+        }),
     );
     return out;
   }
@@ -247,6 +266,14 @@ export class Redactor {
     if (isPerson && /\d/.test(hit) && !ADDRESS_HINT.test(hit.replace(/[\d\s-]+/g, " ").trim().length > 2 ? hit : "")) return null;
     if (isPerson && !hit.includes(" ") && (NOT_A_NAME.has(hit.toLowerCase()) || (hit.length <= 5 && hit === hit.toUpperCase())))
       return null;
+    // A lone capitalised word that merely opens a sentence ("Line one", "Table of
+    // contents") is indistinguishable from an ordinary word; skip it. Full names
+    // and mid-sentence names are unaffected.
+    if (isPerson && !hit.includes(" ")) {
+      const at = new RegExp(wsRe(hit), "i").exec(working);
+      const opens = at && /(?:^|[.!?:]\s+|[\n(])$/.test(working.slice(0, at.index));
+      if (opens && working.trim().split(/\s+/).length > 2) return null;
+    }
     // Grounding: only text that really is in the input may be redacted, and the
     // stored term is the document's own spelling of it (the "exact quote").
     const m = new RegExp(wsRe(hit), "i").exec(working);
@@ -291,7 +318,13 @@ export class Redactor {
 
   spans(text) {
     if (!text) return [];
-    const spans = findPatternSpans(text, { dates: this.dates });
+    // The user's own list wins over everything else.
+    const manual = [];
+    if (this.manual) for (const m of text.matchAll(this.manual)) manual.push({ start: m.index, end: m.index + m[0].length, type: "CUSTOM" });
+    const spans = findPatternSpans(text, { dates: this.dates }).filter(
+      (sp) => !manual.some((m) => sp.start < m.end && sp.end > m.start),
+    );
+    spans.push(...manual);
     if (!this._compiled) this._compile();
     if (this._compiled.length) {
       const taken = new Uint8Array(text.length);

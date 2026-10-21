@@ -84,3 +84,35 @@ writeFileSync(dir + "finance.txt", [
   "Office: Flat 12B, Sunrise Apartments, Andheri West, Mumbai 400053.",
   "NIFTY closed at 22000 and the mutual fund returned 12 percent; the tax filing deadline is next week.",
 ].join("\n"));
+
+// ---- edge cases
+{
+  const W2 = 'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"';
+  const r = (t) => `<w:r><w:t xml:space="preserve">${t}</w:t></w:r>`;
+  const z2 = new JSZip();
+  z2.file("[Content_Types].xml", `<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>`);
+  z2.file("_rels/.rels", `<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>`);
+  z2.file("word/_rels/document.xml.rels", `<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId9" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="mailto:secret.person@example.com" TargetMode="External"/></Relationships>`);
+  z2.file("word/document.xml", `<?xml version="1.0"?><w:document ${W2}><w:body>
+    <w:p>${r("Project Falcon status")}</w:p>
+    <w:tbl><w:tr><w:tc><w:p>${r("PAN: ABCDE")}${r("1234F")}</w:p></w:tc><w:tc><w:p>${r("Phone 98765 43210")}</w:p></w:tc></w:tr></w:tbl>
+  </w:body></w:document>`);
+  z2.file("word/header1.xml", `<?xml version="1.0"?><w:hdr ${W2}><w:p>${r("Confidential: acme wealth pvt ltd")}</w:p></w:hdr>`);
+  writeFileSync(dir + "edge.docx", await z2.generateAsync({ type: "uint8array" }));
+
+  const wb2 = XLSX.utils.book_new();
+  const ws = XLSX.utils.aoa_to_sheet([["Client", "DOB", "Note"], ["x", new Date(Date.UTC(1987, 3, 2)), "call Project Falcon team"]]);
+  ws["B2"].z = "dd-mm-yyyy"; ws["B2"].t = "d";
+  XLSX.utils.book_append_sheet(wb2, ws, "Data");
+  XLSX.writeFile(wb2, dir + "edge.xlsx", { cellDates: true });
+
+  writeFileSync(dir + "edge.csv", "﻿Name;Mobile;Remark\r\n\"Doe; Jane\";0098765;\"line one\nProject Falcon line two\"\r\n");
+  writeFileSync(dir + "edge.txt", "Line one\r\nCall +91 98765 43210\r\nProject Falcon is secret.\r\n");
+
+  const mp = await PDFDocument.create();
+  const f = await mp.embedFont(StandardFonts.Helvetica);
+  for (const txt of ["Page one mail a@b.co", "Page two PAN ABCDE1234F and Project Falcon"]) {
+    mp.addPage([400, 300]).drawText(txt, { x: 30, y: 200, size: 12, font: f });
+  }
+  writeFileSync(dir + "multi.pdf", await mp.save());
+}

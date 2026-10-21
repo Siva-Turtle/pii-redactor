@@ -28,6 +28,9 @@ function question(name, description, argName) {
     }),
   };
 }
+// WORDING MATTERS: Needle is brittle about tool descriptions. Shortening these
+// for speed made it stop finding a plain-word password, so they are kept exactly
+// as validated against test/fixtures/finance.txt. Re-run that test if you edit one.
 // Two phrasings (variant 0 / 1) of every question. Needle is deterministic, so
 // the redactor alternates phrasings between consecutive runs: "nothing found
 // twice in a row" then means two *different* questions both came back empty.
@@ -87,27 +90,45 @@ async function openSession(onDownloadProgress) {
   });
 }
 
+// Output is a few words; cap it so a rambling answer cannot cost seconds.
+const MAX_NEW_TOKENS = 80;
+
 async function ask(session, kind, text, variant) {
-  const res = await session.complete(text, { tools: QUESTIONS[kind][variant % 2] });
+  const res = await session.complete(text, { tools: QUESTIONS[kind][variant % 2], maxNewTokens: MAX_NEW_TOKENS });
   const call = res.function_calls?.[0];
   if (!call) return null;
   const value = Object.values(call.arguments ?? {})[0];
   return typeof value === "string" ? value.trim().replace(/[.,;:]+$/, "") : null;
 }
 
+/** One Needle session per CPU core (measured: N sessions run N questions in the time of one). */
+export function defaultPoolSize() {
+  return Math.max(2, Math.min(6, globalThis.navigator?.hardwareConcurrency || 2));
+}
+
 /**
- * Loads two Needle sessions (separate workers, so two questions run at once).
- * `find(kind, text, variant)` kinds: person, address, account, id, secret, pii.
- * Session 1 answers person/secret/pii, session 2 address/account/id.
+ * Loads a pool of Needle sessions. `find(kind, text, variant)` waits for a free
+ * session, so callers can fire as many questions at once as they like.
+ * kinds: person, address, account, id, secret, pii.
  */
-export async function loadDetector(onDownloadProgress) {
-  const one = await openSession(onDownloadProgress);
-  const two = await openSession(onDownloadProgress);
-  const lane = { person: one, secret: one, pii: one, address: two, account: two, id: two };
+export async function loadDetector(onDownloadProgress, size = defaultPoolSize()) {
+  const sessions = await Promise.all(Array.from({ length: size }, () => openSession(onDownloadProgress)));
+  const idle = [...sessions];
+  const waiting = [];
+  const acquire = () => (idle.length ? Promise.resolve(idle.pop()) : new Promise((resolve) => waiting.push(resolve)));
+  const release = (s) => (waiting.length ? waiting.shift()(s) : idle.push(s));
   return {
-    find: (kind, text, variant = 0) => ask(lane[kind], kind, text, variant),
+    size,
+    async find(kind, text, variant = 0) {
+      const session = await acquire();
+      try {
+        return await ask(session, kind, text, variant);
+      } finally {
+        release(session);
+      }
+    },
     async close() {
-      await Promise.allSettled([one.close(), two.close()]);
+      await Promise.allSettled(sessions.map((x) => x.close()));
     },
   };
 }

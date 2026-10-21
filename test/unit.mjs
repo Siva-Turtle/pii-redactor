@@ -1,7 +1,7 @@
 // Run with: node test/unit.mjs
 import assert from "node:assert";
 import { findPatternSpans, applySpans } from "../js/patterns.js";
-import { Redactor, chunkText, cleanHit } from "../js/redactor.js";
+import { Redactor, chunkText, cleanHit, parseManual } from "../js/redactor.js";
 import { parseCsv, stringifyCsv } from "../js/csv.js";
 
 // Adapts simple per-question fakes to the detector interface: find(kind, text, variant).
@@ -199,7 +199,7 @@ assert.strictEqual(cleanHit("Dr Priya Nair."), "Priya Nair");
     },
   };
   const r = new Redactor({ detector: det });
-  const doc = "Please note that Zed Quux called twice.";
+  const doc = "Please note that Zed Quux called Priya Banerjee twice.";
   await r.learn([doc]);
   const pii = calls.filter((c) => c.kind === "pii");
   // run 1 (variant 0) finds it; runs 2 and 3 (variants 1, 0) are empty -> stop. Exactly 3 runs.
@@ -207,7 +207,7 @@ assert.strictEqual(cleanHit("Dr Priya Nair."), "Priya Nair");
   // the found text is blanked out before the next run, so it is not asked about again
   assert.ok(!pii[1].text.includes("Quux"));
   // the stored term is the document's own spelling, so find-and-replace works
-  assert.strictEqual(r.apply(doc), "Please note that [PII] called twice.".replace("[PII]", "[NAME]"));
+  assert.strictEqual(r.apply(doc), "Please note that [NAME] called Priya Banerjee twice.");
 }
 {
   // a chunk where nothing is ever found takes exactly two runs
@@ -247,5 +247,22 @@ assert.strictEqual(cleanHit("Dr Priya Nair."), "Priya Nair");
   const out = r.apply(doc);
   assert.doesNotMatch(out, /Anita|Desai|55-123-77/);
   assert.match(out, /tax filing/, "lowercase plain words are not PII");
+}
+// --- the user's own list: exact words/lines, case- and spacing-insensitive, beats everything
+{
+  assert.deepStrictEqual(parseManual("Project Falcon, Acme Wealth Pvt Ltd ,,\nSite 7"), ["Project Falcon", "Acme Wealth Pvt Ltd", "Site 7"]);
+  const r = new Redactor({ manual: parseManual("Project Falcon, acme wealth pvt ltd, +91 98765") });
+  const out = r.apply("About project   FALCON: Acme Wealth Pvt Ltd called +91 98765 43210 (not Falconry).");
+  assert.strictEqual(out, "About [REDACTED]: [REDACTED] called [REDACTED] 43210 (not Falconry).");
+  assert.strictEqual(r.counts.CUSTOM, 3);
+  assert.strictEqual(new Redactor({ manual: [] }).apply("nothing here"), "nothing here");
+}
+// --- a lone sentence-opening word is not a name; a mid-sentence one still is
+{
+  const det = { find: async (k, t) => (k === "person" ? (t.startsWith("Line") ? "Line" : t.includes("Priya") ? "Priya" : null) : null) };
+  const r = new Redactor({ detector: det });
+  await r.learn(["Line one of the report.", "Please ask Priya about it."]);
+  assert.strictEqual(r.apply("Line one of the report."), "Line one of the report.");
+  assert.strictEqual(r.apply("Please ask Priya about it."), "Please ask [NAME] about it.");
 }
 console.log("All unit tests passed.");

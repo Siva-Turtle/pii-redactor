@@ -58,7 +58,7 @@ async function learnWithBudget(redactor, texts, status, warnings) {
 
 // ---------------------------------------------------------------- text / md
 async function redactText(file, redactor, status, ext) {
-  const text = new TextDecoder("utf-8").decode(await file.arrayBuffer());
+  const text = new TextDecoder("utf-8", { ignoreBOM: true }).decode(await file.arrayBuffer());
   const warnings = [];
   await learnWithBudget(redactor, [text], status, warnings);
   const out = redactor.apply(text);
@@ -67,9 +67,11 @@ async function redactText(file, redactor, status, ext) {
 
 // --------------------------------------------------------------------- csv
 async function redactCsv(file, redactor, status) {
-  let text = new TextDecoder("utf-8").decode(await file.arrayBuffer());
-  const bom = text.charCodeAt(0) === 0xfeff ? "﻿" : "";
-  text = text.replace(/^﻿/, "");
+  // ignoreBOM keeps the byte-order mark so it can be written back (Excel needs it to read
+  // non-English text in a CSV correctly).
+  let text = new TextDecoder("utf-8", { ignoreBOM: true }).decode(await file.arrayBuffer());
+  const bom = text.charCodeAt(0) === 0xfeff ? "\ufeff" : "";
+  text = text.replace(/^\ufeff/, "");
   const eol = text.includes("\r\n") ? "\r\n" : "\n";
   const delimiter = detectDelimiter(text);
   const rows = parseCsv(text, delimiter);
