@@ -13,7 +13,7 @@ const fx = path.join(__dirname, "fixtures"), out = path.join(__dirname, "out");
   await p.goto(url);
   const names = process.argv.slice(3).length ? process.argv.slice(3) : ["sample.txt","sample.md","sample.csv","sample.xlsx","sample.docx","sample.pdf","scan-like.pdf"];
   await p.setInputFiles("#picker", names.map((n) => path.join(fx, n)));
-  await p.waitForFunction((n) => [...document.querySelectorAll(".file .state")].filter((s) => /^(Done|Could not|Not supported)/.test(s.textContent)).length === n, names.length, { timeout: 600000 });
+  await p.waitForFunction((n) => [...document.querySelectorAll(".file .state")].filter((s) => /^(Done|Could not|Not supported)/.test(s.textContent)).length === n, names.length, { timeout: 1800000 });
   await p.screenshot({ path: path.join(out, "page.png"), fullPage: true });
   const cards = await p.$$eval(".file", (els) => els.map((e) => ({
     name: e.querySelector(".fname").textContent, state: e.querySelector(".state").textContent,

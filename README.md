@@ -41,12 +41,24 @@ Two layers work together, and both are local:
    `loan`, `cheque`, `routing`, `demat`, `DP ID`, `client ID`, `folio`, `policy`, `PRAN`, `UAN`, `CKYC`,
    `passport`, `Aadhaar`, `SSN`, `card`, and `password / PIN / OTP / CVV is …`.
 2. **AI layer** (`js/ai.js`) — [Cactus Needle 3](https://cactuscompute.com/needle), a ~35 MB model running via
-   WebAssembly. It is asked five narrow questions per sentence (only the relevant ones): *person name*, *address*,
-   *bank / demat / folio / policy / loan number*, *government or tax ID*, *password / PIN / OTP / username*. It
-   finds what patterns cannot: an unlabelled `LIC/0034/998877`, a plain-word password, a name in prose, an address.
-   Every answer is checked against the text (it can never invent something to hide), then hidden **everywhere**
-   in that file. Cheap deterministic name cues also work with the AI off: `Mr./Dr. X`, `Dear X`,
-   `Regards, X`, `spouse X`, `Name: X`.
+   WebAssembly. For every sentence it is asked narrow questions (only the relevant ones): *person name*,
+   *address*, *bank / demat / folio / policy / loan number*, *government or tax ID*, *password / PIN / OTP /
+   username*, plus a catch-all **`find_pii`** ("any other personal or sensitive detail") that must **return the
+   exact quote as written in the document**. It finds what patterns cannot: an unlabelled `LIC/0034/998877`, a
+   plain-word password, a name in prose, an address.
+   - **Ask until sure.** Each sentence is re-checked in a loop that only stops after **two consecutive runs find
+     nothing new** (hard cap: 12 runs). Needle is deterministic, so asking the same question twice would just repeat
+     the answer; consecutive runs therefore use two *different phrasings* of each question, and whatever a run found
+     is blanked out of the text before the next run, so it can surface anything the earlier runs were hiding behind.
+   - **Exact quotes only.** An answer is accepted only if it appears in the sentence; the text actually stored is the
+     document's own spelling, so find-and-replace works. Answers from the catch-all are additionally typed by shape
+     and dropped unless convincing (names must be Capitalised words, numbers must contain digits, whole sentences or
+     lowercase phrases are ignored).
+   - Everything found is then hidden **everywhere** in that file. Cheap deterministic name cues also work with the
+     AI off: `Mr./Dr. X`, `Dear X`, `Regards, X`, `spouse X`, `Name: X`.
+   - **Speed:** thorough mode costs roughly 10 seconds per paragraph (about 2 minutes for a dozen lines on a
+     laptop CPU), so the AI pass is time-boxed to 10 minutes per file and you are told if it ran out. *Options →
+     Thorough check* can be unticked for a single quicker pass.
 3. **Spreadsheets/CSV:** columns whose header says *name, email, phone, DOB, address, PAN, Aadhaar, account,
    demat, folio, policy, password…* are hidden whole; other cells go through the two layers above.
 
@@ -70,8 +82,8 @@ Two layers work together, and both are local:
   rather than returned unredacted. Text inside images embedded in Word/PDF files is not read.
 - **Over-redaction is deliberate**: long digit runs and dates are hidden even when harmless, and a name is hidden
   wherever it appears.
-- The AI pass is capped at 600 sections per file (≈ 1 s each); beyond that the patterns still cover the whole
-  file and you are told so.
+- The AI pass is time-boxed (10 minutes per file); beyond that the patterns still cover the whole file and you
+  are told so. Big spreadsheets will usually hit this, so their header-based column hiding matters most.
 - Redacted PDFs are images (bigger, not searchable). Redacted `.xlsx` loses some styling.
 
 ## Hosting it for teammates (one time, ~2 minutes)

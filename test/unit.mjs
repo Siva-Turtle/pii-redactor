@@ -4,6 +4,9 @@ import { findPatternSpans, applySpans } from "../js/patterns.js";
 import { Redactor, chunkText, cleanHit } from "../js/redactor.js";
 import { parseCsv, stringifyCsv } from "../js/csv.js";
 
+// Adapts simple per-question fakes to the detector interface: find(kind, text, variant).
+const METHOD = { person: "findPerson", address: "findAddress", account: "findAccount", id: "findId", secret: "findSecret" };
+const wrap = (o) => ({ find: async (kind, text) => (await o[METHOD[kind]]?.(text)) ?? null });
 const mask = (t, o) => applySpans(t, findPatternSpans(t, o));
 
 // --- patterns (cases ported from the CRM's piiMasking.test.js)
@@ -80,7 +83,7 @@ const fake = {
   },
 };
 {
-  const r = new Redactor({ detector: fake });
+  const r = new Redactor({ detector: wrap(fake) });
   const doc = "Please contact Priya Nair and Meera Rathore. Priya will call. Office: 42 MG Road, Bengaluru 560001. Mail priya@x.com";
   const prog = [];
   await r.learn([doc], { onProgress: (i, n) => prog.push([i, n]) });
@@ -94,20 +97,20 @@ const fake = {
 }
 {
   // Corporate names must not leak their words into token-level matching ("Wealth").
-  const r = new Redactor({ detector: fake });
+  const r = new Redactor({ detector: wrap(fake) });
   await r.learn(["Wire to Acme Wealth Pvt Ltd today"]);
   assert.strictEqual(r.apply("Our wealth plan grew"), "Our wealth plan grew");
 }
 {
   // Grounding: a hallucinated answer that is not in the text must be ignored.
   const liar = { findPerson: async () => "Nobody Here", findAddress: async () => null };
-  const r = new Redactor({ detector: liar });
+  const r = new Redactor({ detector: wrap(liar) });
   await r.learn(["The tax deadline is Friday."]);
   assert.strictEqual(r.apply("The tax deadline is Friday."), "The tax deadline is Friday.");
 }
 {
   // Budget cut-off is reported.
-  const r = new Redactor({ detector: fake });
+  const r = new Redactor({ detector: wrap(fake) });
   const res = await r.learn(Array.from({ length: 10 }, (_, i) => `Section ${i} Text here.`), { maxChunks: 3 });
   assert.strictEqual(res.truncated, true);
   assert.strictEqual(res.scanned, 3);
@@ -128,7 +131,7 @@ const fake = {
     findId: async (t) => (t.includes("ZX-AB-99812") ? "ZX-AB-99812" : null),
     findSecret: async (t) => (t.includes("sunshine99") ? "sunshine99" : null),
   };
-  const r = new Redactor({ dates: false, detector: det });
+  const r = new Redactor({ dates: false, detector: wrap(det) });
   const doc = "Policy LIC/0034/998877 matures. ZX-AB-99812 is my licence. Login pass sunshine99 works. Call on 2026-08-21.";
   await r.learn([doc]);
   const out = r.apply(doc);
@@ -142,7 +145,7 @@ const fake = {
 {
   const doc = "Registered address: Flat 12B, Sunrise Apartments, Andheri West, Mumbai 400053.";
   const det = { findPerson: async () => null, findAddress: async () => "Flat 12B, Sunrise Apartments, Andheri West, Mumbai 400053", findAccount: async () => null, findId: async () => "Flat 12B, Sunrise Apartments, Andheri West, Mumbai 400053" };
-  const r = new Redactor({ detector: det });
+  const r = new Redactor({ detector: wrap(det) });
   await r.learn([doc]);
   assert.strictEqual(r.apply(doc), "Registered address: [ADDRESS].");
 }
@@ -159,14 +162,14 @@ const fake = {
 // An address hit wins over a name hit that sits inside it.
 {
   const det = { findPerson: async (t) => (t.includes("Andheri West") ? "Andheri West" : null), findAddress: async (t) => (t.includes("Flat 12B") ? "Flat 12B, Andheri West, Mumbai 400053" : null) };
-  const r = new Redactor({ detector: det });
+  const r = new Redactor({ detector: wrap(det) });
   const doc = "Address: Flat 12B, Andheri West, Mumbai 400053.";
   await r.learn([doc]);
   assert.doesNotMatch(r.apply(doc), /Flat|Mumbai|400053/);
 }
 // A single acronym such as PAN is not a person.
 {
-  const r = new Redactor({ detector: { findPerson: async () => "PAN", findAddress: async () => null } });
+  const r = new Redactor({ detector: wrap({ findPerson: async () => "PAN", findAddress: async () => null }) });
   await r.learn(["PAN is required."]);
   assert.strictEqual(r.apply("PAN is required."), "PAN is required.");
 }
@@ -181,8 +184,68 @@ const fake = {
 assert.strictEqual(cleanHit("Dear Mr. Rajesh Kumar Sharma,"), "Rajesh Kumar Sharma");
 assert.strictEqual(cleanHit("Dr Priya Nair."), "Priya Nair");
 {
-  const r = new Redactor({ detector: { findPerson: async () => "Registered", findAddress: async () => null } });
+  const r = new Redactor({ detector: wrap({ findPerson: async () => "Registered", findAddress: async () => null }) });
   await r.learn(["Registered office is closed."]);
   assert.strictEqual(r.apply("Registered office is closed."), "Registered office is closed.");
+}
+// --- the loop: stops only after TWO consecutive runs find nothing new
+{
+  const calls = [];
+  const det = {
+    async find(kind, text, variant) {
+      calls.push({ kind, variant, text });
+      if (kind === "pii" && variant === 0 && text.includes("Zed Quux")) return "Zed   Quux"; // sloppy whitespace
+      return null;
+    },
+  };
+  const r = new Redactor({ detector: det });
+  const doc = "Please note that Zed Quux called twice.";
+  await r.learn([doc]);
+  const pii = calls.filter((c) => c.kind === "pii");
+  // run 1 (variant 0) finds it; runs 2 and 3 (variants 1, 0) are empty -> stop. Exactly 3 runs.
+  assert.deepStrictEqual(pii.map((c) => c.variant), [0, 1, 0]);
+  // the found text is blanked out before the next run, so it is not asked about again
+  assert.ok(!pii[1].text.includes("Quux"));
+  // the stored term is the document's own spelling, so find-and-replace works
+  assert.strictEqual(r.apply(doc), "Please note that [PII] called twice.".replace("[PII]", "[NAME]"));
+}
+{
+  // a chunk where nothing is ever found takes exactly two runs
+  const calls = [];
+  const r = new Redactor({ detector: { find: async (k, t, v) => (calls.push([k, v]), null) } });
+  await r.learn(["Nothing sensitive in this sentence at all."]);
+  assert.deepStrictEqual(calls.filter(([k]) => k === "pii").map(([, v]) => v), [0, 1]);
+}
+{
+  // quick mode: one empty run is enough
+  const calls = [];
+  const r = new Redactor({ thorough: false, detector: { find: async (k, t, v) => (calls.push([k, v]), null) } });
+  await r.learn(["Nothing sensitive in this sentence at all."]);
+  assert.deepStrictEqual(calls.filter(([k]) => k === "pii").map(([, v]) => v), [0]);
+}
+{
+  // time budget stops the scan and reports it
+  const r = new Redactor({ detector: { find: async () => (await new Promise((res) => setTimeout(res, 30)), null) } });
+  const res = await r.learn(Array.from({ length: 20 }, (_, i) => `Sentence number ${i} here.`), { maxMs: 100 });
+  assert.strictEqual(res.truncated, true);
+  assert.ok(res.scanned >= 1 && res.scanned < 20);
+}
+{
+  // a model that keeps returning junk can never loop forever
+  let n = 0;
+  const r = new Redactor({ detector: { find: async () => (n++, "Keep Going " + n) } });
+  await r.learn(["Some text with Keep Going words."]);
+  assert.ok(n < 100);
+}
+{
+  // generic answers are typed by shape and filtered
+  const answers = ["Anita Desai", "tax filing", "CRN 55-123-77"];
+  let i = 0;
+  const r = new Redactor({ detector: { find: async (k) => (k === "pii" ? answers[i++] ?? null : null) } });
+  const doc = "Anita Desai asked about tax filing; ref CRN 55-123-77 noted.";
+  await r.learn([doc]);
+  const out = r.apply(doc);
+  assert.doesNotMatch(out, /Anita|Desai|55-123-77/);
+  assert.match(out, /tax filing/, "lowercase plain words are not PII");
 }
 console.log("All unit tests passed.");

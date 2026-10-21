@@ -6,7 +6,8 @@
 import { parseCsv, stringifyCsv, detectDelimiter } from "./csv.js";
 import { labelFor } from "./patterns.js";
 
-const AI_CHUNK_BUDGET = 600;
+// Thorough mode costs roughly 10 s per paragraph, so the AI pass is time-boxed per file.
+const AI_TIME_BUDGET_MS = 10 * 60 * 1000;
 
 export const SUPPORTED = ["pdf", "xlsx", "xls", "csv", "txt", "md", "docx"];
 
@@ -44,12 +45,12 @@ export function headerType(header) {
 async function learnWithBudget(redactor, texts, status, warnings) {
   if (!redactor.detector) return;
   const r = await redactor.learn(texts, {
-    maxChunks: AI_CHUNK_BUDGET,
+    maxMs: AI_TIME_BUDGET_MS,
     onProgress: (i, n) => status(`Looking for names and addresses… ${i} of ${n}`),
   });
   if (r.truncated) {
     warnings.push(
-      `This file is large, so the AI looked at the first ${r.scanned} of ${r.total} sections. ` +
+      `This file is large, so the AI had time for the first ${r.scanned} of ${r.total} sections. ` +
         `Emails, phone numbers, ID numbers and dates were checked everywhere. Please skim the result for stray names.`,
     );
   }

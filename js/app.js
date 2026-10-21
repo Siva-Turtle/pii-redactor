@@ -104,7 +104,7 @@ async function processFile(file) {
       card.state("Getting the AI ready (first time only)…");
       detector = await getDetector();
     }
-    const redactor = new Redactor({ dates: $("optDates").checked, detector });
+    const redactor = new Redactor({ dates: $("optDates").checked, thorough: $("optThorough").checked, detector });
     const status = (text) => {
       card.state(text);
       const m = text.match(/(\d+) of (\d+)/);
