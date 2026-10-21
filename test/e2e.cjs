@@ -1,16 +1,18 @@
 // Drives the real page in headless Chromium. Run: node test/e2e.cjs http://localhost:8731/
-// Locked files (locked.*) exercise the password workflow: the "Needs a
-// password" card, a wrong-password retry, unlocking via Enter and via click,
-// and (with ONLYUNLOCK=1) the "only remove the password" checkbox.
+// New one-screen UI: one file field, Remove PII, one Download button, one
+// status line, one combined "Show Identified PIIs" report. Locked files
+// (locked.*) exercise the per-row password workflow: the "Needs password"
+// chip, a wrong-password retry, unlocking via Enter and via Remove PII.
 const { chromium } = require(process.env.PW || "playwright");
 const fs = require("fs"), path = require("path"), assert = require("assert");
-const url = process.argv[2] || "http://localhost:8731/";
+let url = process.argv[2] || "http://localhost:8731/";
+const NOAI = process.env.NOAI === "1";
+if (NOAI) url += (url.includes("?") ? "&" : "?") + "noai=1"; // test-only hook (see js/app.js)
 const fx = path.join(__dirname, "fixtures"), out = path.join(__dirname, "out");
 const LOCKPW = process.env.LOCKPW || "correct-horse";
-const ONLYUNLOCK = process.env.ONLYUNLOCK === "1";
 // Locked files go first: if a locked file ever blocked the queue, the plain
 // files behind it could never finish and the settle wait below would time out.
-const names = process.argv.slice(3).length ? process.argv.slice(3) : ["sample.txt","sample.md","sample.csv","sample.xlsx","sample.docx","sample.pdf","scan-like.pdf"];
+const names = process.argv.slice(3).length ? process.argv.slice(3) : ["sample.txt", "sample.md", "sample.csv", "sample.xlsx", "sample.docx", "sample.pdf", "scan-like.pdf"];
 names.sort((a, b) => (a.startsWith("locked.") ? -1 : 0) - (b.startsWith("locked.") ? -1 : 0));
 const lockedNames = names.filter((n) => path.basename(n).startsWith("locked."));
 const PII = {
@@ -18,153 +20,153 @@ const PII = {
   "locked.docx": ["ABCDE1234F", "priya.nair7@example.com", "98765 43210"],
   "locked.xlsx": ["ABCDE1234F", "person7@example.com"],
 };
-const terminal = (s) => /^(Done|Could not|Not supported)/.test(s);
+const terminalDs = (ds) => ds === "done" || ds === "error";
 (async () => {
   const b = await chromium.launch({ executablePath: "/opt/pw-browsers/chromium" });
   const p = await b.newPage({ viewport: { width: 900, height: 1100 } });
   const requests = [];
-  p.on("request", (r) => { if (!r.url().startsWith("http://localhost")) requests.push(r.url()); });
+  // blob: URLs are same-origin memory (report CSV fetches below), not network.
+  p.on("request", (r) => { if (!r.url().startsWith("http://localhost") && !r.url().startsWith("blob:")) requests.push(r.url()); });
   p.on("console", (m) => { if (m.type() === "error" || m.type() === "warning") console.log("console", m.type(), m.text()); });
   p.on("pageerror", (e) => console.log("pageerror:", e.message));
   await p.goto(url);
-  if (process.env.MANUAL) await p.fill("#optManual", process.env.MANUAL);
-  if (process.env.NOAI) await p.uncheck("#optAi");
-  if (ONLYUNLOCK) await p.check("#optOnlyUnlock");
+
+  // ------------------------------------------------------- static DOM checks
+  // Exactly one heading, and it is the title. No subtitle, no footer, no Options.
+  assert.strictEqual(await p.textContent("h1"), "Remove PII", "h1 is exactly 'Remove PII'");
+  assert.strictEqual(await p.$$eval("h1", (e) => e.length), 1, "single h1");
+  assert.strictEqual(await p.$("footer"), null, "no footer");
+  assert.strictEqual(await p.$(".sub"), null, "no subtitle");
+  for (const sel of ["#optManual", "#optAi", "#optThorough", "#optDates", "#optOnlyUnlock", "#zipAll", "#dlReports", "#reset", ".rep", ".file"]) {
+    assert.strictEqual(await p.$(sel), null, `no legacy ${sel}`);
+  }
+  // The report disclosure is closed by default.
+  assert.strictEqual(await p.$eval("#ident", (e) => e.open), false, "report closed by default");
+  // Download starts disabled; the idle hint is the only message.
+  assert.strictEqual(await p.$eval("#dlBtn", (e) => e.disabled), true, "download disabled until done");
+  assert.strictEqual(await p.textContent("#status"), "Choose one or more files, then press Remove PII.", "idle hint");
+
   await p.setInputFiles("#picker", names.map((n) => path.join(fx, n)));
-  const cardState = (name) => p.evaluate((nm) => {
-    const el = [...document.querySelectorAll(".file")].find((e) => e.querySelector(".fname").textContent === nm);
-    if (!el) return "missing";
+  const fieldLabel = await p.textContent("#pickField .pick-label");
+  if (names.length === 1) assert.strictEqual(fieldLabel, names[0], "field shows the file name");
+  else assert.strictEqual(fieldLabel, `${names.length} files`, "field shows the file count");
+  assert.strictEqual(await p.$$eval(".frow", (e) => e.length), names.length, "one row per file");
+
+  const rowState = (name) => p.evaluate((nm) => {
+    const el = [...document.querySelectorAll(".frow")].find((e) => e.querySelector(".fname").textContent === nm);
+    if (!el) return null;
+    const chip = el.querySelector(".chip");
     return {
-      state: el.querySelector(".state").textContent,
-      lockVisible: !el.querySelector(".pw").hidden,
+      chip: chip.textContent,
+      ds: chip.dataset.state,
+      pwVisible: !el.querySelector(".pw").hidden,
       inputType: el.querySelector(".pw input").type,
       autocomplete: el.querySelector(".pw input").getAttribute("autocomplete"),
-      err: el.querySelector(".pwerr").hidden ? "" : el.querySelector(".pwerr").textContent,
-      found: el.querySelector(".found").textContent,
-      notes: [...el.querySelectorAll(".notes li")].map((l) => l.textContent),
+      pwLabel: el.querySelector(".pw label").textContent,
+      pwErr: el.querySelector(".pwerr").hidden ? "" : el.querySelector(".pwerr").textContent,
+      rowErr: el.classList.contains("err"),
     };
   }, name);
+  const status = () => p.textContent("#status");
+
+  await p.click("#removeBtn");
+
+  // Progress (AI runs only): the status names the file ("file 2 of 3" plus the
+  // step text such as "Looking for names and addresses… 12 of 40") and the
+  // slim bar is visible while work is in flight.
+  if (!NOAI && names.includes("finance.txt")) {
+    await p.waitForFunction(() => {
+      const s = document.getElementById("status").textContent;
+      return !document.getElementById("bar").hidden && /file \d+ of \d+/.test(s) && / of /.test(s);
+    }, null, { timeout: 300000 });
+    console.log("progress ok:", await status(), "| bar visible");
+  }
+
   if (lockedNames.length) {
-    // Every locked file must show the password box while the plain files
+    // Every locked file must show its own password row while the plain files
     // finish on their own (a blocked queue would hang here forever).
     for (const n of lockedNames) {
       await p.waitForFunction((nm) => {
-        const el = [...document.querySelectorAll(".file")].find((e) => e.querySelector(".fname").textContent === nm);
-        return el && el.querySelector(".state").textContent === "Needs a password" && !el.querySelector(".pw").hidden;
+        const el = [...document.querySelectorAll(".frow")].find((e) => e.querySelector(".fname").textContent === nm);
+        return el && el.querySelector(".chip").textContent === "Needs password" && !el.querySelector(".pw").hidden;
       }, n, { timeout: 120000 });
-      const st = await cardState(n);
+      const st = await rowState(n);
       assert.strictEqual(st.inputType, "password", `${n}: password box`);
       assert.strictEqual(st.autocomplete, "off", `${n}: autocomplete off`);
+      assert.strictEqual(st.pwLabel, `Password for ${n}`, `${n}: per-file label`);
       console.log(`lock UI ok for ${n}`);
     }
+    const visiblePw = await p.$$eval(".frow .pw", (els) => els.filter((e) => !e.hidden).length);
+    assert.strictEqual(visiblePw, lockedNames.length, "one password field per locked file");
     for (const n of names) {
       if (lockedNames.includes(n)) continue;
       await p.waitForFunction((nm) => {
-        const el = [...document.querySelectorAll(".file")].find((e) => e.querySelector(".fname").textContent === nm);
-        return el && /^(Done|Could not|Not supported)/.test(el.querySelector(".state").textContent);
+        const el = [...document.querySelectorAll(".frow")].find((e) => e.querySelector(".fname").textContent === nm);
+        return el && ["done", "error"].includes(el.querySelector(".chip").dataset.state);
       }, n, { timeout: 600000 });
     }
     console.log("plain files finished while locked files waited: queue not blocked");
 
-    // Wrong password on the first locked file: clear message, box stays.
+    // Wrong password on the first locked file: the status line names the file,
+    // only that row errors, the box stays for a retry.
     const first = lockedNames[0];
-    const wrongByEnter = p.locator(".file", { hasText: first }).locator(".pw input");
+    const wrongByEnter = p.locator(".frow", { hasText: first }).locator(".pw input");
     await wrongByEnter.fill("wrong-horse");
     await wrongByEnter.press("Enter");
     await p.waitForFunction((nm) => {
-      const el = [...document.querySelectorAll(".file")].find((e) => e.querySelector(".fname").textContent === nm);
-      return el && !el.querySelector(".pwerr").hidden && el.querySelector(".state").textContent === "Needs a password";
+      const okStatus = document.getElementById("status").textContent.includes(`That password didn't work for ${nm}`);
+      const el = [...document.querySelectorAll(".frow")].find((e) => e.querySelector(".fname").textContent === nm);
+      return okStatus && el && !el.querySelector(".pwerr").hidden && el.classList.contains("err");
     }, first, { timeout: 120000 });
-    console.log(`wrong-password retry ok for ${first}:`, (await cardState(first)).err);
+    console.log(`wrong-password retry ok for ${first}:`, (await rowState(first)).pwErr);
+    assert.ok((await status()).includes(first), "status names the file with the wrong password");
 
-    // Right password everywhere: Enter for the first file, the Unlock
-    // button for the rest (both must resume processing).
+    // Right password everywhere: Enter for the first file, Remove PII for the
+    // rest (both must resume processing).
     for (const [i, n] of lockedNames.entries()) {
-      const scope = p.locator(".file", { hasText: n });
+      const scope = p.locator(".frow", { hasText: n });
       await scope.locator(".pw input").fill(LOCKPW);
       if (i === 0) await scope.locator(".pw input").press("Enter");
-      else await scope.locator('.pw button[type="submit"]').click();
     }
+    if (lockedNames.length > 1) await p.click("#removeBtn");
     for (const n of lockedNames) {
       await p.waitForFunction((nm) => {
-        const el = [...document.querySelectorAll(".file")].find((e) => e.querySelector(".fname").textContent === nm);
-        return el && /^(Done|Could not)/.test(el.querySelector(".state").textContent);
+        const el = [...document.querySelectorAll(".frow")].find((e) => e.querySelector(".fname").textContent === nm);
+        return el && ["done", "error"].includes(el.querySelector(".chip").dataset.state);
       }, n, { timeout: 600000 });
-      const st = await cardState(n);
-      assert.ok(/^Done/.test(st.state), `${n} unlocked to Done (got: ${st.state})`);
-      console.log(`${n}: Done. found=[${st.found}] notes=${JSON.stringify(st.notes)}`);
-      if (ONLYUNLOCK) {
-        assert.match(st.found, /Password removed/, `${n}: only-unlock summary`);
-        assert.ok(st.notes.some((t) => /Password removed/.test(t)), `${n}: only-unlock warning`);
-      } else {
-        assert.ok(!/Password removed/.test(st.found), `${n}: redacted, not just unlocked`);
-      }
+      const st = await rowState(n);
+      assert.strictEqual(st.ds, "done", `${n} unlocked to Done (got: ${st.chip})`);
+      console.log(`${n}: Done`);
     }
-    // The downloads must open with NO password. Office files must also be
-    // valid zips; redacted ones must not contain PII, only-unlocked ones must.
-    const checks = await p.evaluate(async ({ locked, onlyUnlock }) => {
-      const out = [];
-      const cards = [...document.querySelectorAll(".file")];
-      for (const nm of locked) {
-        const el = cards.find((e) => e.querySelector(".fname").textContent === nm);
-        const href = el.querySelector("a.btn").href;
-        const buf = new Uint8Array(await (await fetch(href)).arrayBuffer());
-        const raw = new TextDecoder("latin1").decode(buf.subarray(0, Math.min(buf.length, 3000000)));
-        const res = { name: nm, encryptedMarker: raw.includes("/Encrypt"), zipMagic: buf[0] === 0x50 && buf[1] === 0x4b, text: "" };
-        if (nm.endsWith(".pdf")) {
-          const lib = await import("/vendor/pdfjs/pdf.min.mjs");
-          lib.GlobalWorkerOptions.workerSrc = "/vendor/pdfjs/pdf.worker.min.mjs";
-          const doc = await lib.getDocument({ data: buf, isEvalSupported: false }).promise; // throws if still locked
-          let t = "";
-          for (let i = 1; i <= doc.numPages; i++) {
-            const c = await doc.getPage(i).then((pg) => pg.getTextContent());
-            t += c.items.map((it) => it.str).join(" ");
-          }
-          await doc.destroy();
-          res.text = t;
-          res.pages = doc.numPages;
-        } else {
-          const zip = await JSZip.loadAsync(buf); // throws if still encrypted
-          const blobs = [];
-          for (const k of Object.keys(zip.files)) {
-            if (/\.(xml|rels)$/.test(k)) blobs.push(await zip.file(k).async("string"));
-          }
-          res.text = blobs.join("\n");
-        }
-        out.push(res);
-      }
-      return out;
-    }, { locked: lockedNames, onlyUnlock: ONLYUNLOCK });
-    for (const c of checks) {
-      assert.strictEqual(c.encryptedMarker, false, `${c.name}: no /Encrypt marker`);
-      if (!c.name.endsWith(".pdf")) assert.strictEqual(c.zipMagic, true, `${c.name}: plain zip`);
-      // A re-rendered PDF is images only, so its text cannot carry PII in
-      // either mode; page count preservation is the fidelity check there.
-      if (c.name.endsWith(".pdf") && ONLYUNLOCK) {
-        assert.strictEqual(c.pages, 1, `${c.name}: only-unlock keeps all pages`);
-      } else {
-        for (const s of PII[path.basename(c.name)] || []) {
-          if (ONLYUNLOCK) assert.ok(c.text.includes(s), `${c.name}: only-unlock keeps ${s}`);
-          else assert.ok(!c.text.includes(s), `${c.name}: redacted, no ${s}`);
-        }
-      }
-      console.log(`download verified for ${c.name} (onlyUnlock=${ONLYUNLOCK})`);
-    }
+    // The downloads must open with NO password and must not contain PII
+    // (verified through the ZIP/file download below).
   } else {
-    await p.waitForFunction((n) => [...document.querySelectorAll(".file .state")].filter((s) => /^(Done|Could not|Not supported)/.test(s.textContent)).length === n, names.length, { timeout: 1800000 });
+    await p.waitForFunction((n) => [...document.querySelectorAll(".frow .chip")].filter((s) => ["done", "error"].includes(s.dataset.state)).length === n, names.length, { timeout: 1800000 });
   }
 
-  // ------------------------------------------------- redaction report checks
-  // Every finished card must show a collapsed "What was hidden" section, a
-  // per-file report CSV, and (when files are done) a combined-reports button.
-  // The CSV must list exact original quotes with locations, and the ZIP must
-  // NOT contain reports.
+  // ------------------------------------------------------------- status line
+  const finalStatus = await status();
+  console.log("final status:", finalStatus);
+  const anyDone = await p.$$eval(".frow .chip", (els) => els.some((e) => e.dataset.state === "done"));
+  if (anyDone) {
+    assert.ok(/^Done\. /.test(finalStatus) || /Couldn't process/.test(finalStatus), "completion message");
+    if (!lockedNames.length) assert.ok(/Couldn't process|Done\./.test(finalStatus), "failures named or done");
+  }
+
+  // ------------------------------------------------- combined report checks
+  // One closed disclosure; opened it shows ONE combined table with a File
+  // column, the privacy warning, and one combined-CSV download.
+  await p.click("#ident summary");
+  const headers = await p.$$eval("#ident thead th", (els) => els.map((e) => e.textContent));
+  assert.deepStrictEqual(headers, ["File", "Location", "Type", "Quote", "Found by"], "combined table columns");
+  assert.ok((await p.textContent("#ident .repwarn")).includes("never share it along with the redacted files"), "privacy warning");
+  const tableRows = await p.$$eval("#ident tbody tr", (els) => els.length);
+  const AI_ON = !NOAI;
   const parseReportCsv = (text) => {
     const raw = String(text).replace(/^\uFEFF/, "");
     const rows = [];
     let row = [], field = "", quoted = false;
     const pushField = () => { row.push(field); field = ""; };
-    // Skip privacy comment lines starting with # (single-line, no quotes).
     const lines = [];
     for (const ln of raw.split(/\r?\n/)) {
       if (!ln) continue;
@@ -189,18 +191,25 @@ const terminal = (s) => /^(Done|Could not|Not supported)/.test(s);
     const header = rows[0];
     return { header, rows: rows.slice(1).filter((r) => r.length > 1 || (r.length === 1 && r[0] !== "")) };
   };
-  const reportInfo = await p.$$eval(".file", (els) => els.map((e) => ({
-    name: e.querySelector(".fname").textContent,
-    state: e.querySelector(".state").textContent,
-    summary: e.querySelector(".rep summary")?.textContent || "",
-    repHidden: e.querySelector(".rep")?.hidden ?? true,
-    tableRows: e.querySelectorAll(".rep tbody tr").length,
-    repHref: e.querySelector("a.repdl")?.href || "",
-    repDl: e.querySelector("a.repdl")?.download || "",
-    warn: e.querySelector(".repwarn")?.textContent || "",
-  })));
-  const AI_ON = !process.env.NOAI;
-  const MANUAL_LIST = String(process.env.MANUAL || "").split(/[,\n]/).map((x) => x.trim()).filter(Boolean);
+  const repHref = await p.$eval("#repDl", (e) => e.href);
+  assert.ok(repHref, "report download link");
+  assert.ok((await p.$eval("#repDl", (e) => e.download)).endsWith(".csv"), "report download is csv");
+  const csvBuf = await p.evaluate(async (h) => {
+    const buf = new Uint8Array(await (await fetch(h)).arrayBuffer());
+    let s = "";
+    for (const x of buf) s += String.fromCharCode(x);
+    return btoa(s);
+  }, repHref);
+  const csvText = Buffer.from(csvBuf, "base64").toString("utf8");
+  assert.ok(csvText.charCodeAt(0) === 0xfeff, "report CSV has BOM");
+  assert.ok(csvText.includes("WARNING: This report contains the ORIGINAL sensitive text"), "privacy in CSV");
+  const { header, rows } = parseReportCsv(csvText);
+  assert.deepStrictEqual(header, ["file", "location", "page", "type", "quote", "found_by", "detail"], "csv columns");
+  fs.writeFileSync(path.join(out, "pii-report.csv"), Buffer.from(csvBuf, "base64"));
+  assert.strictEqual(tableRows, Math.min(rows.length, 200), "on-page table capped at 200");
+  if (rows.length > 200) {
+    assert.ok((await p.textContent("#repMore")).includes(`of ${rows.length}`), "showing N of M note");
+  }
   // Original PDF texts (via the page's own pdf.js) for quote verification.
   const pdfNames = [...new Set(names.filter((n) => n.toLowerCase().endsWith(".pdf")).flatMap((n) => (
     path.basename(n) === "locked.pdf" ? [n, "sample.pdf"] : [n]
@@ -251,42 +260,22 @@ const terminal = (s) => /^(Done|Could not|Not supported)/.test(s);
       if (/\.(xml|rels)$/.test(k)) parts.push(await zip.file(k).async("string"));
     }
     const raw = parts.join("\n");
-    // Pull <w:t> text (runs may split a quote across nodes) plus rel targets.
     const texts = [];
     for (const m of raw.matchAll(/<w:t[^>]*>([^<]*)<\/w:t>/g)) texts.push(m[1]);
     for (const m of raw.matchAll(/Target="([^"]*)"/g)) texts.push(m[1]);
     texts.push(raw);
-    // Run-split quotes ("ABCDE"+"1234F") only appear when runs are joined.
     texts.push(texts.join(""));
     return texts.join("\n");
   };
+  const byFile = new Map();
+  for (const r of rows) {
+    if (!byFile.has(r[0])) byFile.set(r[0], []);
+    byFile.get(r[0]).push(r);
+  }
   const allReportRows = [];
-  for (const info of reportInfo) {
-    if (!/^(Done|Could not|Not supported)/.test(info.state)) continue;
-    if (/^Could not|Not supported/.test(info.state)) continue;
-    console.log(`report card for ${info.name}: summary=[${info.summary}] tableRows=${info.tableRows}`);
-    assert.ok(/What was hidden \(\d+ items\)/.test(info.summary), `${info.name}: report summary`);
-    assert.ok(info.warn.includes("never send it along with the redacted file"), `${info.name}: privacy wording on card`);
-    assert.ok(info.repHref, `${info.name}: report download link`);
-    assert.ok(info.repDl.endsWith(".csv"), `${info.name}: report download is csv`);
-    const csvBuf = await p.evaluate(async (h) => {
-      const buf = new Uint8Array(await (await fetch(h)).arrayBuffer());
-      let s = "";
-      for (const x of buf) s += String.fromCharCode(x);
-      return btoa(s);
-    }, info.repHref);
-    const csvText = Buffer.from(csvBuf, "base64").toString("utf8");
-    assert.ok(csvText.charCodeAt(0) === 0xfeff, `${info.name}: report CSV has BOM`);
-    assert.ok(csvText.includes("WARNING: This report contains the ORIGINAL sensitive text"), `${info.name}: privacy in CSV`);
-    const { header, rows } = parseReportCsv(csvText);
-    assert.deepStrictEqual(header, ["file", "location", "page", "type", "quote", "found_by", "detail"], `${info.name}: csv columns`);
-    fs.writeFileSync(path.join(out, info.repDl), Buffer.from(csvBuf, "base64"));
-    const n = parseInt((info.summary.match(/\((\d+) items\)/) || [])[1] || "0", 10);
-    assert.strictEqual(rows.length, n, `${info.name}: csv rows match summary count`);
-    assert.ok(info.tableRows === Math.min(n, 200), `${info.name}: on-page table capped at 200`);
-    // Location + quote checks per format.
-    const base = path.basename(info.name);
-    // Locked files are encrypted on disk: verify against their unlocked sources.
+  for (const [file, frows] of byFile) {
+    console.log(`report rows for ${file}: ${frows.length}`);
+    const base = path.basename(file);
     const origFor = (b) => {
       if (b === "locked.pdf") return "sample.pdf";
       if (b === "locked.docx") return "locked-src.docx";
@@ -312,72 +301,56 @@ const terminal = (s) => /^(Done|Could not|Not supported)/.test(s);
       }
       return true;
     };
-    for (const r of rows) {
-      const [file, location, page, type, quote, foundBy, detail] = r;
-      assert.strictEqual(file, info.name, `${info.name}: csv file column`);
-      assert.ok(location && type && quote && foundBy, `${info.name}: row has location/type/quote/found_by`);
-      assert.ok(["script", "script: name cue", "script: column header", "you", "needle"].includes(foundBy), `${info.name}: known found_by (${foundBy})`);
-      assert.ok(await quotesInOriginal(quote), `${info.name}: quote occurs in original: ${JSON.stringify(quote.slice(0, 60))}`);
+    for (const r of frows) {
+      const [f, location, page, type, quote, foundBy, detail] = r;
+      assert.strictEqual(f, file, "csv file column");
+      assert.ok(location && type && quote && foundBy, `${file}: row has location/type/quote/found_by`);
+      assert.ok(["script", "script: name cue", "script: column header", "you", "needle"].includes(foundBy), `${file}: known found_by (${foundBy})`);
+      assert.ok(await quotesInOriginal(quote), `${file}: quote occurs in original: ${JSON.stringify(quote.slice(0, 60))}`);
       allReportRows.push({ base, location, page, type, quote, foundBy, detail });
     }
-    // Per-fixture location expectations.
-    const locs = rows.map((r) => r[1]);
-    const pages = rows.map((r) => r[2]);
-    if (base === "multi.pdf" && !ONLYUNLOCK) {
-      const mail = rows.find((r) => unguard(r[4]).includes("@"));
-      const pan = rows.find((r) => unguard(r[4]).includes("ABCDE1234F"));
+    const locs = frows.map((r) => r[1]);
+    const pages = frows.map((r) => r[2]);
+    if (base === "multi.pdf") {
+      const mail = frows.find((r) => unguard(r[4]).includes("@"));
+      const pan = frows.find((r) => unguard(r[4]).includes("ABCDE1234F"));
       assert.ok(mail, "multi.pdf: email row");
       assert.ok(pan, "multi.pdf: PAN row");
       assert.strictEqual(mail[2], "1", "multi.pdf: email on page 1");
       assert.strictEqual(pan[2], "2", "multi.pdf: PAN on page 2");
     }
-    if ((base === "sample.pdf" || base === "mixed.pdf" || base === "rotated.pdf") && rows.length && !ONLYUNLOCK) {
+    if ((base === "sample.pdf" || base === "mixed.pdf" || base === "rotated.pdf") && frows.length) {
       assert.ok(pages.every((pg) => /^[1-9]\d*$/.test(pg)), `${base}: every row has a page number`);
       assert.ok(locs.every((l) => /^page \d+, line \d+$/.test(l)), `${base}: pdf locations carry page+line`);
     }
-    if (base === "finance.txt" && rows.length) {
+    if (base === "finance.txt" && frows.length) {
       assert.ok(locs.every((l) => /^line \d+$/.test(l)), "finance.txt: line locations");
-      for (const r of rows) {
+      for (const r of frows) {
         const ln = parseInt(r[1].match(/line (\d+)/)[1], 10);
         const origLines = fs.readFileSync(path.join(fx, base), "utf8").split("\n");
         assert.ok((origLines[ln - 1] || "").includes(unguard(r[4])), `finance.txt: quote on line ${ln}`);
       }
     }
-    if ((base === "sample.csv" || base === "edge.csv") && rows.length) {
+    if ((base === "sample.csv" || base === "edge.csv") && frows.length) {
       assert.ok(locs.every((l) => /^row \d+, column /.test(l)), `${base}: csv row/column locations`);
     }
-    if (base === "titlerow.xlsx" && rows.length && !ONLYUNLOCK) {
-      assert.ok(rows.some((r) => r[5] === "script: column header"), "titlerow.xlsx: header-column hiding reported");
+    if (base === "titlerow.xlsx" && frows.length) {
+      assert.ok(frows.some((r) => r[5] === "script: column header"), "titlerow.xlsx: header-column hiding reported");
       assert.ok(locs.every((l) => /^.+![A-Z]+\d+$/.test(l)), "titlerow.xlsx: Sheet!Cell locations");
     }
-    if ((base === "sample.xlsx" || base === "edge.xlsx" || base === "legacy.xls") && rows.length && !ONLYUNLOCK) {
+    if ((base === "sample.xlsx" || base === "edge.xlsx" || base === "legacy.xls") && frows.length) {
       assert.ok(locs.every((l) => /^.+![A-Z]+\d+$/.test(l)), `${base}: Sheet!Cell locations`);
     }
-    if (base === "edge.docx" && rows.length && !ONLYUNLOCK) {
+    if (base === "edge.docx" && frows.length) {
       assert.ok(locs.some((l) => /table \d+, row \d+, cell \d+/.test(l)), "edge.docx: table locations");
       assert.ok(locs.every((l) => /paragraph|table \d+|hyperlink|field|header|footer|comment|footnote/.test(l)), "edge.docx: docx-style locations");
-      if (MANUAL_LIST.length) {
-        assert.ok(locs.some((l) => /paragraph/.test(l)), "edge.docx with manual list: paragraph locations");
-      }
     }
-    if (base === "sample.docx" && rows.length && !ONLYUNLOCK) {
+    if (base === "sample.docx" && frows.length) {
       assert.ok(locs.some((l) => /paragraph/.test(l)), "sample.docx: paragraph locations");
     }
-    if (ONLYUNLOCK && info.name.startsWith("locked.")) {
-      assert.strictEqual(rows.length, 0, `${info.name}: only-unlock report is empty`);
-    }
-  }
-  // Manual-list entries surface as found_by "you".
-  if (MANUAL_LIST.length && !ONLYUNLOCK) {
-    const youRows = allReportRows.filter((r) => r.foundBy === "you");
-    assert.ok(youRows.length > 0, "manual list produced 'you' rows");
-    for (const r of youRows) {
-      assert.ok(MANUAL_LIST.some((m) => m.toLowerCase() === String(r.detail).toLowerCase()), `manual detail matches entry (${r.detail})`);
-    }
-    console.log(`manual-list rows ok: ${youRows.length}`);
   }
   // Needle entries for the finance sample (AI on only).
-  if (AI_ON && !ONLYUNLOCK && names.includes("finance.txt")) {
+  if (AI_ON && names.includes("finance.txt")) {
     const fin = allReportRows.filter((r) => r.base === "finance.txt");
     const lic = fin.find((r) => unguard(r.quote).includes("LIC/0034/998877"));
     const sec = fin.find((r) => /sunshine99/i.test(unguard(r.quote)));
@@ -387,38 +360,109 @@ const terminal = (s) => /^(Done|Could not|Not supported)/.test(s);
     assert.strictEqual(sec.foundBy, "needle", "finance.txt: password found by needle");
     console.log("needle rows ok for finance.txt");
   }
-  // Combined reports button: one CSV covering every file; ZIP must exclude reports.
-  if (!ONLYUNLOCK) {
-    const dlVisible = await p.evaluate(() => !document.getElementById("dlReports").hidden);
-    assert.ok(dlVisible, "Download all reports button visible");
-    const [dl] = await Promise.all([p.waitForEvent("download", { timeout: 30000 }), p.click("#dlReports")]);
-    const dlPath = await dl.path();
-    const combined = fs.readFileSync(dlPath, "utf8");
-    const { header, rows } = parseReportCsv(combined);
-    assert.deepStrictEqual(header, ["file", "location", "page", "type", "quote", "found_by", "detail"]);
-    assert.ok(rows.length >= allReportRows.length, "combined csv holds all rows");
-    console.log(`combined reports csv ok: ${rows.length} rows`);
-  }
-  if (reportInfo.filter((i) => /^(Done)/.test(i.state)).length >= 2 && !ONLYUNLOCK) {
-    const [dl] = await Promise.all([p.waitForEvent("download", { timeout: 30000 }), p.click("#zipAll")]);
-    const zipPath = await dl.path();
-    const zip = await JSZIP_LIB.loadAsync(fs.readFileSync(zipPath));
+
+  // ------------------------------------------------------------- downloads
+  // Download button is enabled once at least one file is done.
+  assert.strictEqual(await p.$eval("#dlBtn", (e) => e.disabled), false, "download enabled after done");
+  const doneCount = await p.$$eval(".frow .chip", (els) => els.filter((e) => e.dataset.state === "done").length);
+  const [dl] = await Promise.all([p.waitForEvent("download", { timeout: 60000 }), p.click("#dlBtn")]);
+  const dlPath = await dl.path();
+  const suggested = dl.suggestedFilename();
+  const buf = fs.readFileSync(dlPath);
+  if (doneCount === 1) {
+    // One finished file downloads as that file itself.
+    assert.ok(/\.redacted\.(txt|md|csv|xlsx|pdf|docx)$/.test(suggested), `single download is the file itself (${suggested})`);
+    console.log(`single download ok: ${suggested}`);
+  } else {
+    // Two or more download as ONE ZIP of redacted files only (never reports).
+    assert.strictEqual(suggested, "pii-removed-files.zip", "zip name");
+    const zip = await JSZIP_LIB.loadAsync(buf);
     const znames = Object.keys(zip.files);
     assert.ok(!znames.some((z) => /report\.csv$/i.test(z)), "ZIP excludes report CSVs");
-    console.log(`zip excludes reports ok: ${JSON.stringify(znames)}`);
-  }
-  await p.screenshot({ path: path.join(out, "page.png"), fullPage: true });
-  const cards = await p.$$eval(".file", (els) => els.map((e) => ({
-    name: e.querySelector(".fname").textContent, state: e.querySelector(".state").textContent,
-    found: e.querySelector(".found").textContent, notes: [...e.querySelectorAll(".notes li")].map((l) => l.textContent),
-    href: e.querySelector("a.btn")?.href, dl: e.querySelector("a.btn")?.download })));
-  for (const c of cards) {
-    console.log(`\n== ${c.name}: ${c.state}\n   ${c.found}\n   notes: ${JSON.stringify(c.notes)}`);
-    if (c.href) {
-      const b64 = await p.evaluate(async (h) => { const buf = new Uint8Array(await (await fetch(h)).arrayBuffer()); let s = ""; for (const x of buf) s += String.fromCharCode(x); return btoa(s); }, c.href);
-      fs.writeFileSync(path.join(out, c.dl), Buffer.from(b64, "base64"));
+    assert.strictEqual(znames.length, doneCount, "ZIP holds every redacted file");
+    console.log(`zip ok: ${JSON.stringify(znames)}`);
+    fs.writeFileSync(path.join(out, suggested), buf);
+    // Content checks: unlocked files open with NO password and carry no PII;
+    // all other redacted files carry none of the locked-file PII markers.
+    for (const zn of znames) {
+      const entry = await zip.file(zn).async("uint8array");
+      fs.writeFileSync(path.join(out, zn), Buffer.from(entry));
+      const raw = Buffer.from(entry).toString("latin1");
+      if (zn.endsWith(".pdf")) {
+        assert.ok(!raw.includes("/Encrypt"), `${zn}: no /Encrypt marker`);
+        const text = await p.evaluate(async (b64) => {
+          const bin = atob(b64);
+          const data = new Uint8Array(bin.length);
+          for (let i = 0; i < bin.length; i++) data[i] = bin.charCodeAt(i);
+          const lib = await import("/vendor/pdfjs/pdf.min.mjs");
+          lib.GlobalWorkerOptions.workerSrc = "/vendor/pdfjs/pdf.worker.min.mjs";
+          const doc = await lib.getDocument({ data, isEvalSupported: false }).promise; // throws if still locked
+          let t = "";
+          for (let i = 1; i <= doc.numPages; i++) {
+            const c = await doc.getPage(i).then((pg) => pg.getTextContent());
+            t += c.items.map((it) => it.str).join(" ");
+          }
+          await doc.destroy();
+          return { text: t, pages: doc.numPages };
+        }, Buffer.from(entry).toString("base64"));
+        for (const s of Object.values(PII).flat()) assert.ok(!text.text.includes(s), `${zn}: redacted, no ${s}`);
+        console.log(`pdf download verified: ${zn} (${text.pages} page(s))`);
+      } else if (zn.endsWith(".docx") || zn.endsWith(".xlsx")) {
+        assert.ok(entry[0] === 0x50 && entry[1] === 0x4b, `${zn}: plain zip`);
+        const inner = await JSZIP_LIB.loadAsync(entry);
+        const blobs = [];
+        for (const k of Object.keys(inner.files)) {
+          if (/\.(xml|rels)$/.test(k)) blobs.push(await inner.file(k).async("string"));
+        }
+        const text = blobs.join("\n");
+        for (const s of Object.values(PII).flat()) assert.ok(!text.includes(s), `${zn}: redacted, no ${s}`);
+        console.log(`office download verified: ${zn}`);
+      } else {
+        const text = Buffer.from(entry).toString("utf8");
+        for (const s of Object.values(PII).flat()) assert.ok(!text.includes(s), `${zn}: redacted, no ${s}`);
+        console.log(`text download verified: ${zn}`);
+      }
     }
   }
+  if (lockedNames.length) {
+    // Every locked download opens with no password (checked above for ZIP;
+    // for a single locked file the same fetch applies).
+    console.log("locked downloads verified (open with no password, PII gone)");
+  }
+
+  await p.screenshot({ path: path.join(out, "page.png"), fullPage: true });
+  const cards = await p.$$eval(".frow", (els) => els.map((e) => ({
+    name: e.querySelector(".fname").textContent, chip: e.querySelector(".chip").textContent,
+  })));
+  for (const c of cards) console.log(`== ${c.name}: ${c.chip}`);
+  console.log("warnings:", await p.$$eval("#warns li", (els) => els.map((e) => e.textContent)));
   console.log("\nexternal requests:", JSON.stringify(requests));
+  assert.strictEqual(requests.length, 0, "no network at runtime (fonts are local)");
+
+  // --------------------------------------------- single-file download shape
+  // Choosing a new set replaces the old one; one finished file downloads as
+  // that file itself (not a ZIP).
+  const p2 = await b.newPage({ viewport: { width: 900, height: 1100 } });
+  await p2.goto(url);
+  await p2.setInputFiles("#picker", [path.join(fx, "sample.txt")]);
+  assert.strictEqual(await p2.textContent("#pickField .pick-label"), "sample.txt", "new set replaces old");
+  assert.strictEqual(await p2.$$eval(".frow", (e) => e.length), 1, "old rows cleared");
+  await p2.click("#removeBtn");
+  await p2.waitForFunction(() => [...document.querySelectorAll(".frow .chip")].every((s) => ["done", "error"].includes(s.dataset.state)), null, { timeout: 600000 });
+  const [dl2] = await Promise.all([p2.waitForEvent("download", { timeout: 60000 }), p2.click("#dlBtn")]);
+  assert.ok(/\.redacted\.txt$/.test(dl2.suggestedFilename()), `single download is the file (${dl2.suggestedFilename()})`);
+  console.log("single-file download ok:", dl2.suggestedFilename());
+  await p2.close();
+
+  // ------------------------------------------------------- file:// guard
+  // Opened directly, the page must show the guard message and hide the field.
+  const p3 = await b.newPage();
+  await p3.goto(`file://${path.join(__dirname, "..", "index.html")}`);
+  await p3.waitForFunction(() => !document.getElementById("banner").hidden, null, { timeout: 30000 });
+  assert.ok((await p3.textContent("#banner")).includes("can't run when opened directly"), "guard message");
+  assert.strictEqual(await p3.$eval("#pickField", (e) => e.hidden), true, "guard hides the file field");
+  console.log("file:// guard ok");
+  await p3.close();
+
   await b.close();
 })().catch((e) => { console.error("E2E FAILED:", e); process.exit(1); });

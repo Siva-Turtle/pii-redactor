@@ -3,13 +3,13 @@
 // instead of leaving a dead page.
 (function () {
   var banner = document.getElementById("banner");
-  var drop = document.getElementById("drop");
+  var field = document.getElementById("pickField");
   function show(text) {
     if (banner) {
       banner.textContent = text;
       banner.hidden = false;
     }
-    if (drop) drop.hidden = true;
+    if (field) field.hidden = true;
   }
   if (location.protocol === "file:") {
     show(

@@ -10,5 +10,7 @@
 | [SheetJS CE](https://github.com/SheetJS/sheetjs) | reads/writes .xlsx | Apache-2.0 |
 | [@noble/hashes](https://github.com/paulmillr/noble-hashes) (SHA-512 only, bundled as `vendor/noble-crypto.min.mjs`) | password-to-key derivation for protected Office files | MIT |
 | [@noble/ciphers](https://github.com/paulmillr/noble-ciphers) (AES-CBC only, same bundle) | decrypts protected Office files | MIT |
+| [Fraunces](https://github.com/undercase/Fraunces) (500 latin woff2, `vendor/fonts/fraunces-500.woff2` via [@fontsource/fraunces](https://github.com/fontsource/font-files)) | display font for the heading | OFL-1.1 |
+| [Inter](https://github.com/rsms/inter) (400/500/600 latin woff2, `vendor/fonts/inter-*.woff2` via [@fontsource/inter](https://github.com/fontsource/fontsource)) | text font for the UI | OFL-1.1 |
 
 The regular-expression layer in `js/patterns.js` is ported from the Turtle CRM's `backend/utils/piiMasking.js`.

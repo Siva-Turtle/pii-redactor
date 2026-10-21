@@ -4,117 +4,226 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Private Redactor</title>
+<link rel="icon" href="data:,">
 <!-- This page cannot talk to any other website: connect-src is limited to this
      origin, so documents have nowhere to be sent even by accident. -->
 <meta http-equiv="Content-Security-Policy"
-  content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self' blob:; connect-src 'self' blob: data:; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; form-action 'none'; base-uri 'none'">
+  content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self' blob:; connect-src 'self' blob: data:; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; font-src 'self'; form-action 'none'; base-uri 'none'">
 <style>
+  /* Visual language ported from the Siva's Copy editorial reference
+     (.oc-inputs/sivas-copy-index.html: tokens, .btn-p, modal-card inputs,
+     hairline borders, 8px radii, focus ring, type scale). */
+  @font-face {
+    font-family: "Fraunces";
+    src: url("vendor/fonts/fraunces-500.woff2") format("woff2");
+    font-weight: 500; font-style: normal; font-display: swap;
+  }
+  @font-face {
+    font-family: "Inter";
+    src: url("vendor/fonts/inter-400.woff2") format("woff2");
+    font-weight: 400; font-style: normal; font-display: swap;
+  }
+  @font-face {
+    font-family: "Inter";
+    src: url("vendor/fonts/inter-500.woff2") format("woff2");
+    font-weight: 500; font-style: normal; font-display: swap;
+  }
+  @font-face {
+    font-family: "Inter";
+    src: url("vendor/fonts/inter-600.woff2") format("woff2");
+    font-weight: 600; font-style: normal; font-display: swap;
+  }
   :root {
-    --bg: #f5f7f6; --card: #ffffff; --ink: #17211d; --muted: #5d6b65; --line: #dbe3df;
-    --accent: #0f7b5f; --accent-ink: #ffffff; --accent-soft: #e3f3ed;
-    --warn: #8a5a00; --warn-bg: #fff4dc; --bad: #a12626; --bad-bg: #fdeaea;
+    color-scheme: light;
+    --bg: #faf8f4; --surface: #ffffff;
+    --ink: #1f1d1a; --ink-2: #5e5a54; --ink-3: #6b665e;
+    --hair: #e7e2da; --accent: #3b3f8f; --accent-soft: #ecebf4;
+    --urgent: #a3362b; --done: #2f6b4f; --wait: #8a6a1f;
+    --shadow: rgba(31, 29, 26, 0.08);
   }
   @media (prefers-color-scheme: dark) {
-    :root {
-      --bg: #101614; --card: #19211e; --ink: #e8efec; --muted: #9db0a8; --line: #2b3834;
-      --accent: #36b48e; --accent-ink: #06231a; --accent-soft: #17332b;
-      --warn: #f0c36a; --warn-bg: #36290e; --bad: #ff9c9c; --bad-bg: #3a1b1b;
+    :root:not([data-theme="light"]) {
+      --bg: #1b1a18; --surface: #24221f;
+      --ink: #ede9e2; --ink-2: #b5afa5; --ink-3: #a39d93;
+      --hair: #34312c; --accent: #a9ace8; --accent-soft: #2a2a3d;
+      --urgent: #e08a7e; --done: #8cc3a5; --wait: #d9b465;
+      --shadow: rgba(0, 0, 0, 0.45);
+      color-scheme: dark;
     }
   }
+  :root[data-theme="dark"] {
+    --bg: #1b1a18; --surface: #24221f;
+    --ink: #ede9e2; --ink-2: #b5afa5; --ink-3: #a39d93;
+    --hair: #34312c; --accent: #a9ace8; --accent-soft: #2a2a3d;
+    --urgent: #e08a7e; --done: #8cc3a5; --wait: #d9b465;
+    --shadow: rgba(0, 0, 0, 0.45);
+    color-scheme: dark;
+  }
   * { box-sizing: border-box; }
-  body { margin: 0; background: var(--bg); color: var(--ink);
-    font: 16px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
-  main { max-width: 720px; margin: 0 auto; padding: 40px 16px 64px; }
-  h1 { font-size: 28px; margin: 0 0 6px; letter-spacing: -0.01em; }
-  .sub { color: var(--muted); margin: 0 0 28px; }
-  .banner { padding: 12px 14px; border-radius: 10px; margin: 0 0 16px; font-size: 15px; }
-  .banner.warn { background: var(--warn-bg); color: var(--warn); }
-  .banner.bad { background: var(--bad-bg); color: var(--bad); }
-  #drop { display: block; border: 2px dashed var(--line); border-radius: 16px; background: var(--card);
-    padding: 44px 20px; text-align: center; cursor: pointer; transition: border-color .15s, background .15s; }
-  #drop:hover, #drop:focus-within, #drop.over { border-color: var(--accent); background: var(--accent-soft); }
-  #drop strong { display: block; font-size: 20px; margin-bottom: 4px; }
-  #drop span { color: var(--muted); font-size: 14px; }
-  #drop input { position: absolute; width: 1px; height: 1px; opacity: 0; }
-  details { margin: 14px 2px; color: var(--muted); font-size: 15px; }
-  summary { cursor: pointer; }
-  .opts { display: grid; gap: 8px; margin-top: 10px; color: var(--ink); }
-  .opts label { display: flex; gap: 10px; align-items: flex-start; }
-  .opts label.stack { flex-direction: column; gap: 6px; }
-  textarea { width: 100%; font: inherit; padding: 8px 10px; border-radius: 10px; border: 1px solid var(--line);
-    background: var(--card); color: var(--ink); resize: vertical; }
-  .opts small { color: var(--muted); display: block; }
-  ul#files { list-style: none; padding: 0; margin: 20px 0 0; display: grid; gap: 12px; }
-  .file { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 14px 16px; }
-  .row { display: flex; gap: 12px; align-items: center; justify-content: space-between; flex-wrap: wrap; }
-  .fname { font-weight: 600; word-break: break-all; }
-  .state { color: var(--muted); font-size: 14px; }
-  .state.ok { color: var(--accent); font-weight: 600; }
-  .state.err { color: var(--bad); font-weight: 600; }
-  .bar { height: 6px; border-radius: 3px; background: var(--line); overflow: hidden; margin-top: 10px; }
-  .bar > div { height: 100%; width: 0; background: var(--accent); transition: width .2s; }
-  .notes { margin: 10px 0 0; padding-left: 18px; font-size: 14px; color: var(--warn); }
-  .found { font-size: 14px; color: var(--muted); margin-top: 6px; }
-  .pwrow { display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap; }
-  .pwrow input { font: inherit; padding: 9px 12px; border-radius: 10px; border: 1px solid var(--line);
-    background: var(--card); color: var(--ink); min-width: 200px; flex: 1; }
-  .pwerr { color: var(--bad); font-size: 14px; margin-top: 8px; }
-  .pwhint { color: var(--muted); font-size: 14px; margin-top: 8px; }
-  button, a.btn { font: inherit; font-weight: 600; border: 0; border-radius: 10px; padding: 9px 16px;
-    background: var(--accent); color: var(--accent-ink); cursor: pointer; text-decoration: none; display: inline-block; }
-  button.secondary { background: transparent; color: var(--accent); border: 1px solid var(--line); }
-  button:focus-visible, a.btn:focus-visible, summary:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
-  .actions { display: flex; gap: 10px; margin-top: 18px; flex-wrap: wrap; }
-  .rep { margin-top: 12px; font-size: 14px; }
-  .rep summary { cursor: pointer; font-weight: 600; }
-  .repwarn { color: var(--warn); margin: 8px 0; }
-  .repwrap { overflow-x: auto; }
-  .rep table { border-collapse: collapse; width: 100%; font-size: 13px; }
-  .rep th, .rep td { border: 1px solid var(--line); padding: 4px 8px; text-align: left; vertical-align: top; word-break: break-word; }
-  .rep th { background: var(--bg); }
-  .repmore { color: var(--muted); margin-top: 6px; }
-  footer { margin-top: 36px; color: var(--muted); font-size: 13px; }
+  html, body { overflow-x: clip; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 400 15px/1.6 Inter, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  main { max-width: 720px; margin: 0 auto; padding: 40px 16px 64px; min-width: 0; }
+  h1 {
+    font-family: Fraunces, Georgia, serif; font-weight: 500;
+    font-size: clamp(24px, 2.8vw, 30px); line-height: 1.15; letter-spacing: -0.01em;
+    margin: 0 0 20px; overflow-wrap: anywhere;
+  }
+  /* File field: a button dressed as a select/input, chevron included. */
+  .field {
+    display: flex; align-items: center; gap: 12px; width: 100%;
+    font: 400 14px/1.5 Inter, sans-serif; color: var(--ink); background: var(--bg);
+    border: 1px solid var(--hair); border-radius: 8px; padding: 10px 12px;
+    min-height: 44px; cursor: pointer; text-align: left;
+  }
+  .field:hover { border-color: var(--accent); }
+  .field.over { border-color: var(--accent); background: var(--accent-soft); }
+  .field .pick-label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .field .pick-label.placeholder { color: var(--ink-3); }
+  .field svg { flex: none; }
+  #picker { position: absolute; width: 1px; height: 1px; opacity: 0; }
+  ul#files { list-style: none; padding: 0; margin: 12px 0 0; display: grid; gap: 8px; }
+  .frow { border-bottom: 1px solid var(--hair); padding: 8px 0; min-width: 0; }
+  .frow .top { display: flex; gap: 12px; align-items: baseline; justify-content: space-between; }
+  .fname { font-weight: 500; font-size: 14px; overflow-wrap: anywhere; min-width: 0; }
+  .chip {
+    flex: none; font: 600 11px/1.4 Inter, sans-serif; text-transform: uppercase;
+    letter-spacing: 0.08em; color: var(--ink-3); white-space: nowrap;
+  }
+  .chip[data-state="working"], .chip[data-state="waiting"] { color: var(--wait); }
+  .chip[data-state="done"] { color: var(--done); }
+  .chip[data-state="error"] { color: var(--urgent); }
+  .pw { margin: 8px 0 0; display: grid; gap: 6px; }
+  .pw label { font-size: 13px; color: var(--ink-2); }
+  .pw input {
+    width: 100%; box-sizing: border-box; font: 400 14px/1.5 Inter, sans-serif;
+    color: var(--ink); background: var(--bg); border: 1px solid var(--hair);
+    border-radius: 8px; padding: 10px 12px;
+  }
+  .pw .pwerr { color: var(--urgent); font-size: 13px; }
+  .frow.err input { border-color: var(--urgent); }
+  .btnrow { display: flex; gap: 12px; margin-top: 20px; flex-wrap: wrap; align-items: center; }
+  .btn-p {
+    display: inline-flex; align-items: center; justify-content: center;
+    background: var(--accent); color: var(--bg); border: 0; border-radius: 8px;
+    height: 44px; padding: 0 22px; font: 600 14px/1 Inter, sans-serif; cursor: pointer;
+  }
+  .btn-p:hover { filter: brightness(1.1); }
+  .btn-p:disabled { opacity: 0.4; cursor: not-allowed; }
+  .btn-s {
+    display: inline-flex; align-items: center; justify-content: center;
+    background: none; color: var(--accent); border: 1px solid var(--hair); border-radius: 8px;
+    height: 44px; padding: 0 22px; font: 600 14px/1 Inter, sans-serif; cursor: pointer;
+    text-decoration: none;
+  }
+  .btn-s:hover { background: var(--accent-soft); }
+  .btn-s:disabled, .btn-s[aria-disabled="true"] { opacity: 0.4; cursor: not-allowed; }
+  #status { font-size: 14px; color: var(--ink-2); margin: 12px 0 0; overflow-wrap: anywhere; }
+  #status .err { color: var(--urgent); }
+  #bar { height: 3px; background: var(--hair); border-radius: 2px; margin-top: 8px; }
+  #barfill { height: 3px; background: var(--accent); border-radius: 2px; width: 0; }
+  ul#warns { margin: 8px 0 0; padding-left: 18px; font-size: 13px; color: var(--ink-3); }
+  details#ident { margin-top: 20px; font-size: 14px; color: var(--ink-2); }
+  details#ident summary { cursor: pointer; color: var(--accent); font-weight: 600; }
+  details#ident .repwarn { color: var(--ink-3); margin: 8px 0; font-size: 13px; }
+  details#ident .repwrap { overflow-x: auto; }
+  details#ident table { border-collapse: collapse; width: 100%; min-width: 640px; font-size: 13px; color: var(--ink); }
+  details#ident th, details#ident td {
+    border: 1px solid var(--hair); padding: 4px 8px; text-align: left;
+    vertical-align: top;
+  }
+  /* File/Type/Found-by never break inside a word; Location wraps only at spaces. */
+  details#ident th:nth-child(1), details#ident td:nth-child(1),
+  details#ident th:nth-child(3), details#ident td:nth-child(3),
+  details#ident th:nth-child(5), details#ident td:nth-child(5) { white-space: nowrap; }
+  details#ident th:nth-child(2), details#ident td:nth-child(2) {
+    white-space: normal; overflow-wrap: normal; word-break: normal;
+  }
+  /* Quote wraps at spaces first, breaks a long unbroken token only as a last resort. */
+  details#ident td:nth-child(4) {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    overflow-wrap: anywhere;
+  }
+  details#ident th { background: var(--bg); }
+  details#ident .repmore { color: var(--ink-3); margin-top: 6px; font-size: 13px; }
+  details#ident .btn-s { height: 40px; padding: 0 16px; margin-top: 8px; }
+  .banner { padding: 12px 14px; border-radius: 8px; margin: 0 0 16px; font-size: 15px; }
+  .banner.bad { background: var(--accent-soft); color: var(--urgent); }
   [hidden] { display: none !important; }
+  @media (max-width: 640px) {
+    main { padding: 28px 16px 48px; }
+    h1 { font-size: 24px; line-height: 1.2; }
+    .btnrow .btn-p, .btnrow .btn-s { flex: 1 1 100%; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    * { animation-duration: 120ms !important; transition-duration: 120ms !important; }
+  }
 </style>
 </head>
 <body>
 <main>
-  <h1>Private Redactor</h1>
-  <p class="sub">Hide names, phone numbers, emails and ID numbers in your documents. Everything happens on this computer — your files are never uploaded.</p>
+  <h1>Remove PII</h1>
 
   <div id="banner" class="banner bad" hidden></div>
-  <div id="aiNote" class="banner warn" hidden></div>
 
-  <label id="drop">
-    <input id="picker" type="file" multiple accept=".pdf,.docx,.xlsx,.xls,.csv,.txt,.md">
-    <strong>Drop your files here, or click to choose</strong>
-    <span>PDF · Word · Excel · CSV · Text · Markdown</span>
-  </label>
+  <button type="button" id="pickField" class="field" aria-label="Choose files to redact">
+    <span class="pick-label placeholder">Choose files…</span>
+    <svg width="12" height="8" viewBox="0 0 12 8" aria-hidden="true"><path d="M1 1l5 5 5-5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+  </button>
+  <input id="picker" type="file" multiple accept=".pdf,.docx,.xlsx,.xls,.csv,.txt,.md" tabindex="-1" aria-hidden="true">
 
+  <!--
+  hidden by design: Options removed from UI; backend still supports it.
   <details open>
     <summary>Options</summary>
     <div class="opts">
-      <label class="stack"><span>Always hide these exact words or lines <small>Optional. Separate with commas, e.g. <em>Project Falcon, Acme Wealth Pvt Ltd, Site 7</em>. Capital letters and extra spaces don't matter.</small></span>
+      <label class="stack"><span>Always hide these exact words or lines …</span>
         <textarea id="optManual" rows="2" spellcheck="false" placeholder="Project Falcon, Acme Wealth Pvt Ltd"></textarea></label>
       <label><input id="optAi" type="checkbox" checked>
-        <span>Also find names, addresses and other private details with the built-in AI <small>Recommended. Runs on this computer. Slower, but catches things that have no fixed format.</small></span></label>
+        <span>Also find names, addresses and other private details with the built-in AI …</span></label>
       <label><input id="optThorough" type="checkbox" checked>
-        <span>Thorough check <small>Keeps asking the AI until it finds nothing new twice in a row. Safer, but slower (about 10 seconds per paragraph). Untick for a quicker single pass.</small></span></label>
+        <span>Thorough check …</span></label>
       <label><input id="optDates" type="checkbox" checked>
-        <span>Hide dates <small>Birth dates are often used as passwords, so they are hidden. Untick to keep ordinary dates.</small></span></label>
+        <span>Hide dates …</span></label>
       <label><input id="optOnlyUnlock" type="checkbox">
-        <span>Only remove the password (don't hide anything) <small>For password-protected files: return them unlocked, exactly as they are. The password is never saved or sent anywhere.</small></span></label>
+        <span>Only remove the password (don't hide anything) …</span></label>
     </div>
   </details>
-
-  <ul id="files"></ul>
+  <ul id="files-cards"></ul>
   <div class="actions" id="actions" hidden>
     <button id="zipAll" hidden>Download all as ZIP</button>
     <button id="dlReports" class="secondary" hidden>Download all reports (.csv)</button>
     <button id="reset" class="secondary">Start over</button>
   </div>
+  <p class="sub">…subtitle…</p>
+  <footer>…footer…</footer>
+  -->
 
-  <footer>Names and addresses are found by Cactus Needle, a 35&nbsp;MB model that runs inside your browser. Always give the result a quick look before sharing it.</footer>
+  <ul id="files"></ul>
+
+  <div class="btnrow">
+    <button type="button" id="removeBtn" class="btn-p">Remove PII</button>
+    <button type="button" id="dlBtn" class="btn-s" disabled>Download PII removed File</button>
+  </div>
+
+  <p id="status" role="status" aria-live="polite">Choose one or more files, then press Remove PII.</p>
+  <div id="bar" hidden><div id="barfill"></div></div>
+  <ul id="warns" hidden></ul>
+
+  <details id="ident">
+    <summary>Show Identified PIIs</summary>
+    <p class="repwarn">This list shows the original sensitive text that was hidden. Keep it private — never share it along with the redacted files.</p>
+    <div class="repwrap"><table aria-label="Identified personal information">
+      <thead><tr><th>File</th><th>Location</th><th>Type</th><th>Quote</th><th>Found by</th></tr></thead>
+      <tbody id="repBody"></tbody>
+    </table></div>
+    <p class="repmore" id="repMore" hidden></p>
+    <a id="repDl" class="btn-s" href="#" download="pii-report.csv" hidden>Download report (.csv)</a>
+  </details>
 </main>
 
 <script src="js/guard.js"></script>

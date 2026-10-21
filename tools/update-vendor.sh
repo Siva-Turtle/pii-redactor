@@ -12,6 +12,13 @@ cp $N/cactus-needle/vendor/needle.wasm $V/needle/needle.wasm
 cp $N/cactus-needle/vendor/LICENSE $V/needle/LICENSE-needle
 cp $N/pdfjs-dist/build/pdf.min.mjs $N/pdfjs-dist/build/pdf.worker.min.mjs $V/pdfjs/
 cp $N/jszip/dist/jszip.min.js $N/xlsx/dist/xlsx.full.min.js $N/pdf-lib/dist/pdf-lib.min.js $V/
+# Self-hosted UI fonts (OFL): Fraunces 500 (headings) + Inter 400/500/600
+# (body), latin subset woff2 only (~90 KB total, no network at runtime).
+mkdir -p $V/fonts
+cp $N/@fontsource/fraunces/files/fraunces-latin-500-normal.woff2 $V/fonts/fraunces-500.woff2
+cp $N/@fontsource/inter/files/inter-latin-400-normal.woff2 $V/fonts/inter-400.woff2
+cp $N/@fontsource/inter/files/inter-latin-500-normal.woff2 $V/fonts/inter-500.woff2
+cp $N/@fontsource/inter/files/inter-latin-600-normal.woff2 $V/fonts/inter-600.woff2
 # Sync SHA-512 + raw AES-CBC for Office password removal (js/office-crypto.js).
 # Only sha512 and cbc are bundled; the alias resolves noble's node crypto shim.
 cat > .noble-entry.mjs <<'EOF'

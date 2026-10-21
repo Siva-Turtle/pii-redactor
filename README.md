@@ -19,9 +19,15 @@ other website.
 
 A browser tab opens. Then:
 
-1. **Drop your files** on the page (or click it to choose).
-2. Wait for **Done** (the first file takes a few extra seconds while the AI wakes up).
-3. Click **Download redacted file** (or **Download all as ZIP**).
+1. **Choose your files** in the file field (click it, or drop files onto it).
+2. If a file is password-protected, its row shows a **password box** — type the
+   password there (other files keep processing while it waits).
+3. Click **Remove PII** and watch the status line. Pressing Enter in a password
+   box, or clicking Remove PII again, processes the files that now have a password.
+4. Click **Download PII removed File** (one file downloads as that file; two or
+   more download as one `pii-removed-files.zip`).
+5. Open **Show Identified PIIs** to see everything that was hidden, or download
+   the combined report (`.csv`) from inside that section.
 
 Keep the black start-up window open while you work; close it to stop. Mac/Linux need Python 3 (already on most
 machines; the start file tells you if it is missing). Windows needs nothing extra.
@@ -34,9 +40,9 @@ machines; the start file tells you if it is missing). Windows needs nothing extr
 Two layers work together, and both are local:
 
 1. **Pattern layer** (`js/patterns.js`, grown from the CRM's `backend/utils/piiMasking.js`). Exact formats:
-   **PAN, Aadhaar, phone, email**, UPI IDs, GSTIN, TAN, IFSC, NSDL demat IDs (`IN300123 10234567`), voter ID,
-   credit/debit cards (incl. Amex), US SSN, 15–18-digit account numbers, IP addresses, and dates (birth dates
-   double as passwords on Form 16s and statements; there is an option to keep dates).
+   **PAN, Aadhaar, phone, email**, UPI IDs, GSTIN, TAN, IFSC, NSDL demat IDs (`IN300123 10234567`),
+   voter ID, credit/debit cards (incl. Amex), US SSN, 15–18-digit account numbers, IP addresses, and dates.
+   Dates are always hidden (birth dates double as passwords on Form 16s and statements).
    **Labelled values** are caught by their label, whatever their format: `a/c`, `account no`, `savings`,
    `loan`, `cheque`, `routing`, `demat`, `DP ID`, `client ID`, `folio`, `policy`, `PRAN`, `UAN`, `CKYC`,
    `passport`, `Aadhaar`, `SSN`, `card`, and `password / PIN / OTP / CVV is …`.
@@ -57,14 +63,10 @@ Two layers work together, and both are local:
    - Everything found is then hidden **everywhere** in that file. Cheap deterministic name cues also work with the
      AI off: `Mr./Dr. X`, `Dear X`, `Regards, X`, `spouse X`, `Name: X`.
    - **Speed:** Needle runs in one worker per CPU core (up to 6), and every question for every sentence is
-     queued across them. Measured: asking N questions at once costs the same as asking one, so the finance sample
-     (12 lines, 81 model calls) takes ~33 s on a 4-core machine, down from 137 s with two workers. The AI pass is
-     time-boxed to 10 minutes per file, and you are told if it ran out. *Options → Thorough check* can be unticked
-     for a single, quicker pass. Sentences with nothing worth asking about (no names, digits or `@`) are skipped.
-3. **Your own list.** *Options → "Always hide these exact words or lines"* takes comma-separated items such as
-   `Project Falcon, Acme Wealth Pvt Ltd`. They are hidden everywhere, ignoring capitals and extra spaces, and
-   win over every other rule. They show up as `[REDACTED]`.
-4. **Spreadsheets/CSV:** columns whose header says *name, email, phone, DOB, address, PAN, Aadhaar, account,
+   queued across them. Measured: asking N questions at once costs the same as asking one, so the finance sample
+   (12 lines, 81 model calls) takes ~33 s on a 4-core machine, down from 137 s with two workers. The AI pass is
+   time-boxed to 10 minutes per file, and you are told in the status line if it ran out. Sentences with nothing worth asking about (no names, digits or `@`) are skipped.
+3. **Spreadsheets/CSV:** columns whose header says *name, email, phone, DOB, address, PAN, Aadhaar, account,
    demat, folio, policy, password…* are hidden whole; other cells go through the two layers above.
 
 | File | What you get back |
@@ -77,14 +79,14 @@ Two layers work together, and both are local:
 
 ## Redaction report
 
-Every finished file gets a collapsed **“What was hidden (N items)”** section: a compact table of
-location, type, the exact original quote, and who found it. A **“Download report (.csv)”** button on each
-card downloads the full list; **“Download all reports (.csv)”** next to *Download all as ZIP* downloads one
-combined CSV for every file.
+Open **Show Identified PIIs** (closed until you open it) to see ONE combined table
+for all files: file, location, type, the exact original quote, and who found it.
+A **Download report (.csv)** link inside that section downloads the full list
+(cap: the on-page table shows the first ~200 rows with a "showing N of M" note).
 
 > **Keep the report private.** The report contains the ORIGINAL sensitive text that was hidden. Never send it
 > along with the redacted file. The downloadable CSV starts with the same warning. Reports live in memory
-> only (never stored, never sent anywhere) and are deliberately **not** included in *Download all as ZIP*.
+> only (never stored, never sent anywhere) and are deliberately **not** included in the ZIP download.
 
 CSV columns: `file, location, page, type, quote, found_by, detail` (UTF-8 with BOM for Excel). Cells starting
 with `= + - @` (or tab/CR) get a leading apostrophe so Excel can't run them as formulas. `found_by` is one of
@@ -102,21 +104,21 @@ Locations by file type (Word files don't store page numbers, so no pages are inv
 | TXT/MD | `line N` |
 | DOCX | `body, paragraph N`, `body, table T, row R, cell C`, `header`/`footer`/`footnote`/`endnote`/`comment` paragraph, `hyperlink`, `field` |
 
-In *“Only remove the password”* mode the report is empty (with a note), because nothing was hidden.
+In *“Only remove the password”* mode (backend support in `js/handlers.js`; no
+checkbox in the page) the report is empty (with a note), because nothing was hidden.
 
 ## Password-protected files
 
-Drop in a locked **PDF, `.docx` or `.xlsx`** and the card asks for its password instead of failing. Type it
-and press Enter (or click **Unlock**): the file is unlocked on this computer and goes through the normal
-checks, and the download is a plain unprotected file. A wrong password just says so — try again. While a
-file waits for its password, other files keep processing; nothing queues up behind it.
-
-*Options → "Only remove the password (don't hide anything)"* returns the unlocked file exactly as it is,
-with nothing hidden. For PDFs the pages are re-drawn as pictures (this tool's PDF output is always images),
-so the text can no longer be selected — the card says so.
+Choose a locked **PDF, `.docx` or `.xlsx`** and its row shows its own password
+box (`Password for <file>`) instead of failing. Type the password and press Enter
+in the box (or click **Remove PII**): the file is unlocked on this computer and
+goes through the normal checks, and the download is a plain unprotected file. A
+wrong password marks only that row and the status line says which file it was
+for — try again. While a file waits for its password, other files keep
+processing; nothing queues up behind it.
 
 Very old protection can't be opened: Word/Excel 97–2003 files, and the pre-2013 "standard" Office
-encryption. The card tells you to re-save the file without a password and try again. The password itself
+encryption. The status line tells you to re-save the file without a password and try again. The password itself
 is never saved, sent, logged or kept: it lives only until the file is processed, then the box is cleared.
 
 ## What it can and cannot do (please read)
@@ -164,10 +166,18 @@ python3 serve.py --no-browser &            # http://localhost:8731
 node test/e2e.cjs http://localhost:8731/   # all formats, AI on
 node test/e2e.cjs http://localhost:8731/ mixed.pdf && node test/pixel-check.cjs   # PDF boxes fully cover PII
 PW=$(npm root -g)/playwright NOAI=1 node test/e2e.cjs http://localhost:8731/ locked.pdf locked.docx locked.xlsx sample.txt
-                                           # password workflow: lock card, wrong-password retry, unlock, unencrypted downloads
-PW=$(npm root -g)/playwright NOAI=1 ONLYUNLOCK=1 node test/e2e.cjs http://localhost:8731/ locked.pdf locked.docx locked.xlsx
-                                           # "only remove the password" mode
+                                           # password workflow: password row, wrong-password retry, unlock, unencrypted downloads
 ```
+
+The visible UI is deliberately one screen with fixed settings (AI on, thorough
+check always on, dates hidden, no manual list, `onlyUnlock` off — see the named
+constants at the top of `js/app.js`). The removed Options panel, per-file cards
+and extra download buttons are commented out in `index.html` and `js/app.js`
+(marked "hidden by design"); the backend still supports everything
+(`Redactor` manual list, `onlyUnlock` handler paths, per-file report builders —
+all unit-tested). To re-enable an option: restore the commented markup in
+`index.html`, rewire the commented lines in `js/app.js`, and add the matching
+assertions back to `test/e2e.cjs`.
 
 Why a local server at all? Browsers refuse to run WebAssembly workers from a double-clicked `file://` page, so
 the Start files serve the folder on `http://localhost` (this computer only).
