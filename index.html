@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Private Redactor</title>
+<!-- This page cannot talk to any other website: connect-src is limited to this
+     origin, so documents have nowhere to be sent even by accident. -->
+<meta http-equiv="Content-Security-Policy"
+  content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self' blob:; connect-src 'self' blob: data:; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; form-action 'none'; base-uri 'none'">
+<style>
+  :root {
+    --bg: #f5f7f6; --card: #ffffff; --ink: #17211d; --muted: #5d6b65; --line: #dbe3df;
+    --accent: #0f7b5f; --accent-ink: #ffffff; --accent-soft: #e3f3ed;
+    --warn: #8a5a00; --warn-bg: #fff4dc; --bad: #a12626; --bad-bg: #fdeaea;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #101614; --card: #19211e; --ink: #e8efec; --muted: #9db0a8; --line: #2b3834;
+      --accent: #36b48e; --accent-ink: #06231a; --accent-soft: #17332b;
+      --warn: #f0c36a; --warn-bg: #36290e; --bad: #ff9c9c; --bad-bg: #3a1b1b;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+    font: 16px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  main { max-width: 720px; margin: 0 auto; padding: 40px 16px 64px; }
+  h1 { font-size: 28px; margin: 0 0 6px; letter-spacing: -0.01em; }
+  .sub { color: var(--muted); margin: 0 0 28px; }
+  .banner { padding: 12px 14px; border-radius: 10px; margin: 0 0 16px; font-size: 15px; }
+  .banner.warn { background: var(--warn-bg); color: var(--warn); }
+  .banner.bad { background: var(--bad-bg); color: var(--bad); }
+  #drop { display: block; border: 2px dashed var(--line); border-radius: 16px; background: var(--card);
+    padding: 44px 20px; text-align: center; cursor: pointer; transition: border-color .15s, background .15s; }
+  #drop:hover, #drop:focus-within, #drop.over { border-color: var(--accent); background: var(--accent-soft); }
+  #drop strong { display: block; font-size: 20px; margin-bottom: 4px; }
+  #drop span { color: var(--muted); font-size: 14px; }
+  #drop input { position: absolute; width: 1px; height: 1px; opacity: 0; }
+  details { margin: 14px 2px; color: var(--muted); font-size: 15px; }
+  summary { cursor: pointer; }
+  .opts { display: grid; gap: 8px; margin-top: 10px; color: var(--ink); }
+  .opts label { display: flex; gap: 10px; align-items: flex-start; }
+  .opts small { color: var(--muted); display: block; }
+  ul#files { list-style: none; padding: 0; margin: 20px 0 0; display: grid; gap: 12px; }
+  .file { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 14px 16px; }
+  .row { display: flex; gap: 12px; align-items: center; justify-content: space-between; flex-wrap: wrap; }
+  .fname { font-weight: 600; word-break: break-all; }
+  .state { color: var(--muted); font-size: 14px; }
+  .state.ok { color: var(--accent); font-weight: 600; }
+  .state.err { color: var(--bad); font-weight: 600; }
+  .bar { height: 6px; border-radius: 3px; background: var(--line); overflow: hidden; margin-top: 10px; }
+  .bar > div { height: 100%; width: 0; background: var(--accent); transition: width .2s; }
+  .notes { margin: 10px 0 0; padding-left: 18px; font-size: 14px; color: var(--warn); }
+  .found { font-size: 14px; color: var(--muted); margin-top: 6px; }
+  button, a.btn { font: inherit; font-weight: 600; border: 0; border-radius: 10px; padding: 9px 16px;
+    background: var(--accent); color: var(--accent-ink); cursor: pointer; text-decoration: none; display: inline-block; }
+  button.secondary { background: transparent; color: var(--accent); border: 1px solid var(--line); }
+  button:focus-visible, a.btn:focus-visible, summary:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+  .actions { display: flex; gap: 10px; margin-top: 18px; flex-wrap: wrap; }
+  footer { margin-top: 36px; color: var(--muted); font-size: 13px; }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Private Redactor</h1>
+  <p class="sub">Hide names, phone numbers, emails and ID numbers in your documents. Everything happens on this computer — your files are never uploaded.</p>
+
+  <div id="banner" class="banner bad" hidden></div>
+  <div id="aiNote" class="banner warn" hidden></div>
+
+  <label id="drop">
+    <input id="picker" type="file" multiple accept=".pdf,.docx,.xlsx,.xls,.csv,.txt,.md">
+    <strong>Drop your files here, or click to choose</strong>
+    <span>PDF · Word · Excel · CSV · Text · Markdown</span>
+  </label>
+
+  <details>
+    <summary>Options</summary>
+    <div class="opts">
+      <label><input id="optAi" type="checkbox" checked>
+        <span>Also find names and addresses with the built-in AI <small>Recommended. Runs on this computer. Slower, but catches names that have no fixed format.</small></span></label>
+      <label><input id="optDates" type="checkbox" checked>
+        <span>Hide dates <small>Birth dates are often used as passwords, so they are hidden. Untick to keep ordinary dates.</small></span></label>
+    </div>
+  </details>
+
+  <ul id="files"></ul>
+  <div class="actions" id="actions" hidden>
+    <button id="zipAll" hidden>Download all as ZIP</button>
+    <button id="reset" class="secondary">Start over</button>
+  </div>
+
+  <footer>Names and addresses are found by Cactus Needle, a 35&nbsp;MB model that runs inside your browser. Always give the result a quick look before sharing it.</footer>
+</main>
+
+<script src="vendor/jszip.min.js"></script>
+<script src="vendor/xlsx.full.min.js"></script>
+<script src="vendor/pdf-lib.min.js"></script>
+<script type="module" src="js/app.js"></script>
+</body>
+</html>

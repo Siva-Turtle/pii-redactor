@@ -1,0 +1,13 @@
+{
+  "name": "private-redactor-vendor",
+  "private": true,
+  "description": "Only used by update-vendor.sh to refresh the files in ../vendor. Not needed to run the tool.",
+  "dependencies": {
+    "cactus-needle": "0.3.0",
+    "esbuild": "^0.25.0",
+    "jszip": "^3.10.1",
+    "pdf-lib": "^1.17.1",
+    "pdfjs-dist": "4.10.38",
+    "xlsx": "0.18.5"
+  }
+}

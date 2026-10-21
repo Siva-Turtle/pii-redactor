@@ -1,0 +1,12 @@
+# Third-party components (all bundled in `vendor/`, no network needed at runtime)
+
+| Component | Use | License |
+|---|---|---|
+| [Cactus Needle 3](https://huggingface.co/Cactus-Compute/needle3) weights + WASM engine | finds names and addresses | Apache-2.0 |
+| [cactus-needle](https://github.com/afshinm/cactus-needle) (browser wrapper, community package) | loads Needle in a Web Worker | Apache-2.0 |
+| [pdf.js](https://github.com/mozilla/pdf.js) | reads PDF text and draws pages | Apache-2.0 |
+| [pdf-lib](https://github.com/Hopding/pdf-lib) | writes the redacted PDF | MIT |
+| [JSZip](https://github.com/Stuk/jszip) | opens/saves .docx and builds the ZIP download | MIT (dual-licensed MIT/GPLv3) |
+| [SheetJS CE](https://github.com/SheetJS/sheetjs) | reads/writes .xlsx | Apache-2.0 |
+
+The regular-expression layer in `js/patterns.js` is ported from the Turtle CRM's `backend/utils/piiMasking.js`.
