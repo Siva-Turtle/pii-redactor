@@ -73,3 +73,14 @@ console.log("fixtures written");
   writeFileSync(dir + "mixed.pdf", await doc.save());
   writeFileSync(dir + "mixed.expected.json", JSON.stringify(expected));
 }
+
+writeFileSync(dir + "finance.txt", [
+  "Client: Rajesh Kumar Sharma (spouse Meera Sharma). PAN ABCDE1234F, Aadhaar 1234 5678 9012.",
+  "Kindly credit my SBI savings A/C no. 3456-7890-1234 and send the statement to rajesh.sharma@example.com.",
+  "Demat account: IN30012310234567, DP ID 12081600, folio no 1234567/89 in the Axis Bluechip fund.",
+  "The LIC policy LIC/0034/998877 matures in 2031; loan reference HL-445566-77 is closed.",
+  "Password for the Form 16 PDF is sunshine99 and the OTP is 482913. Call +91 98765 43210.",
+  "Passport K1234567 and voter ID ABC1234567 are attached. Born 2 April 1987.",
+  "Office: Flat 12B, Sunrise Apartments, Andheri West, Mumbai 400053.",
+  "NIFTY closed at 22000 and the mutual fund returned 12 percent; the tax filing deadline is next week.",
+].join("\n"));

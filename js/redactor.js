@@ -9,7 +9,7 @@
 // `detector`) discovers names and addresses; each one found is then redacted
 // EVERYWHERE it occurs in the file, not only in the chunk that revealed it.
 
-import { applySpans, findPatternSpans, labelFor } from "./patterns.js";
+import { NOT_A_SECRET, applySpans, findPatternSpans, labelFor } from "./patterns.js";
 
 // Needle is only reliable on short, sentence-sized input (measured), so text is
 // split per sentence/line; only tiny neighbouring fragments are merged.
@@ -66,11 +66,16 @@ export function chunkText(text) {
   return chunks;
 }
 
+const KINDS = ["ADDRESS", "ACCOUNT", "ID", "SECRET", "NAME"]; // match priority, highest first
+const newTerms = () => Object.fromEntries(KINDS.map((k) => [k, new Set()]));
+// Leading label words the model includes with a number ("DP ID 12081600").
+const cleanValue = (hit) => hit.trim().replace(/^(?:[A-Za-z]+[\s:#]+)+(?=\S*\d)/, "").replace(/[\s,;:.]+$/, "");
+
 export class Redactor {
   constructor({ dates = true, detector = null } = {}) {
     this.dates = dates;
     this.detector = detector;
-    this.terms = { NAME: new Set(), ADDRESS: new Set() };
+    this.terms = newTerms();
     this.tokens = new Set(); // single first/last names, matched case-sensitively
     this.counts = {};
     this.seen = new Set();
@@ -80,7 +85,7 @@ export class Redactor {
   /** Reset the per-file tally (terms learned in earlier files are kept out too). */
   resetFile() {
     this.counts = {};
-    this.terms = { NAME: new Set(), ADDRESS: new Set() };
+    this.terms = newTerms();
     this.tokens = new Set();
     this.seen = new Set();
     this._compiled = null;
@@ -128,22 +133,36 @@ export class Redactor {
           if (NOT_A_NAME.has(w.toLowerCase()) || TITLES.test(w)) break;
           words.push(w);
         }
-        if (words.length) this._addTerm(words.join(" "), true);
+        if (words.length) this._addTerm(words.join(" "), "NAME");
       }
     }
   }
 
   async _scanChunk(chunk) {
+    const d = this.detector;
     const rest = applySpans(chunk, findPatternSpans(chunk, { dates: true }), () => " ");
     const wantPerson = /\p{Lu}\p{L}{2,}/u.test(rest);
     const wantAddress = ADDRESS_HINT.test(rest);
+    // A digit-bearing token the patterns did not already claim.
+    const wantNumber = /\b[A-Za-z]*\d[\dA-Za-z/-]{3,}/.test(rest);
+    const wantSecret = /(?:pass\w*|pwd|\bpw\b|\bpin\b|otp|cvv|cvc|login|user ?(?:name|id)|credential|secret)\W+\w{3,}/i.test(rest);
+    // The two Needle sessions work in parallel; each runs its own questions in turn.
     await Promise.all([
-      wantPerson ? this._loop(chunk, (t) => this.detector.findPerson(t), MAX_NAMES_PER_CHUNK, true) : null,
-      wantAddress ? this._loop(chunk, (t) => this.detector.findAddress(t), 2, false) : null,
+      (async () => {
+        if (wantPerson) await this._loop(chunk, (t) => d.findPerson(t), MAX_NAMES_PER_CHUNK, "NAME");
+        if (wantSecret && d.findSecret) await this._loop(chunk, (t) => d.findSecret(t), 2, "SECRET");
+      })(),
+      (async () => {
+        if (wantAddress) await this._loop(chunk, (t) => d.findAddress(t), 2, "ADDRESS");
+        if (wantNumber && d.findAccount) await this._loop(chunk, (t) => d.findAccount(t), 3, "ACCOUNT");
+        if (wantNumber && d.findId) await this._loop(chunk, (t) => d.findId(t), 2, "ID");
+      })(),
     ]);
   }
 
-  async _loop(chunk, find, max, isPerson) {
+  async _loop(chunk, find, max, kind) {
+    const isPerson = kind === "NAME";
+    const isValue = kind === "ACCOUNT" || kind === "ID" || kind === "SECRET";
     let working = chunk;
     for (let i = 0; i < max; i++) {
       let hit;
@@ -153,8 +172,18 @@ export class Redactor {
         return;
       }
       if (!hit) return;
-      hit = cleanHit(hit);
-      if (hit.length < 2 || /[:]/.test(hit)) return;
+      hit = isValue ? cleanValue(hit) : cleanHit(hit);
+      if (hit.length < 2 || hit.length > 140) return;
+      if (!isValue && /[:]/.test(hit)) return;
+      if (isValue) {
+        const digits = /\d/.test(hit);
+        if (kind !== "SECRET" && (!digits || hit.length < 5)) return;
+        // An account/ID is one compact token (or a few digit groups), never a phrase.
+        if (kind !== "SECRET" && (/,/.test(hit) || (hit.match(/\p{L}{3,}/gu) || []).length > 1)) return;
+        if (kind === "SECRET" && (hit.length < 4 || NOT_A_SECRET.test(hit))) return;
+        // A date that the user chose to keep is not an account number.
+        if (findPatternSpans(hit, { dates: true }).some((sp) => sp.type === "DATE" && sp.end - sp.start === hit.length)) return;
+      }
       // Something a pattern already owns (a date, a phone number) is not a name.
       if (isPerson && findPatternSpans(hit, { dates: true }).length) return;
       if (isPerson && /\d/.test(hit) && !ADDRESS_HINT.test(hit.replace(/[\d\s-]+/g, " ").trim().length > 2 ? hit : "")) return;
@@ -163,18 +192,15 @@ export class Redactor {
       const re = new RegExp(wsRe(hit), "i");
       // Grounding check: only text that really is in the input may be redacted.
       if (!re.test(working) || /\[[A-Z]+\]/.test(hit)) return;
-      this._addTerm(hit, isPerson);
+      this._addTerm(hit, kind);
       working = working.replace(new RegExp(wsRe(hit), "gi"), "_");
     }
   }
 
-  _addTerm(raw, isPerson) {
+  _addTerm(raw, kind) {
     const term = raw.replace(/\s+/g, " ").trim();
     if (term.length < 2 || term.length > 140) return;
-    const asAddress = !isPerson || /\d/.test(term);
-    if (asAddress) {
-      this.terms.ADDRESS.add(term);
-    } else {
+    if (kind === "NAME" && !/\d/.test(term)) {
       this.terms.NAME.add(term);
       const words = term.split(" ");
       const tokenizable = words.length <= 3 && !term.includes(",") && !CORPORATE.test(term);
@@ -183,6 +209,8 @@ export class Redactor {
           if (/^\p{Lu}\p{L}{3,}$/u.test(w) && !TITLES.test(w)) this.tokens.add(w);
         }
       }
+    } else {
+      this.terms[kind === "NAME" ? "ADDRESS" : kind].add(term);
     }
     this._compiled = null;
   }
@@ -195,11 +223,11 @@ export class Redactor {
       const body = [...set].sort((a, b) => b.length - a.length).map(wsRe).join("|");
       return edge(body, flags);
     };
+    // KINDS order matters. ADDRESS precedes NAME because the model sometimes
+    // also reports a piece of an address (e.g. a locality) as a name, and the
+    // longer address match must win.
     this._compiled = [
-      // ADDRESS first: the model sometimes also reports a piece of an address
-      // (e.g. a locality) as a name, and the longer address match must win.
-      { type: "ADDRESS", re: build(this.terms.ADDRESS, "giu") },
-      { type: "NAME", re: build(this.terms.NAME, "giu") },
+      ...KINDS.map((type) => ({ type, re: build(this.terms[type], "giu") })),
       { type: "NAME", re: build(this.tokens, "gu") },
     ].filter((c) => c.re);
   }

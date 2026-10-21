@@ -26,7 +26,13 @@ export function headerType(header) {
   if (/phone|mobile|whats\s?app|contact\s*(no|num)|\btel\b/i.test(h)) return "PHONE";
   if (/\bdob\b|birth/i.test(h)) return "DATE";
   if (/address|street|locality|pin\s*code|postal|\bzip/i.test(h)) return "ADDRESS";
-  if (/\b(pan|aadhaa?r|ssn|passport|ifsc|gstin)\b|(account|a\/c|card)\s*(no|num)/i.test(h)) return "ID";
+  if (/password|passcode|\bpin\b|\botp\b|\bcvv\b/i.test(h)) return "SECRET";
+  if (/demat|\bbo\s*id|\bdp\s*id|client\s*id/i.test(h)) return "DEMAT";
+  if (/folio/i.test(h)) return "FOLIO";
+  if (/policy\s*(no|num)|\bpran\b|\buan\b|\bckyc\b/i.test(h)) return "POLICY";
+  if (/\b(pan|aadhaa?r|ssn|passport|gstin|tan|voter|epic|itin)\b/i.test(h)) return "ID";
+  if (/account|a\/c|\bacct\b|\bifsc\b|\bmicr\b|\bswift\b|\biban\b|routing|card\s*(no|num)|cif\b|customer\s*id|loan\s*(no|num|id)|cheque/i.test(h))
+    return "ACCOUNT";
   if (
     /name/i.test(h) &&
     !/file|sheet|company|bank|scheme|fund|product|plan|branch|city|state|country|nick|user|business|organi[sz]ation|entity|employer/i.test(h)

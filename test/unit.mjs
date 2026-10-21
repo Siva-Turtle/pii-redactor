@@ -36,11 +36,38 @@ assert.match(mask("Account 123456789012345678 held"), /\[ACCOUNT\]/);
 assert.match(mask("Server 192.168.1.20 down"), /\[IP\]/);
 for (const d of ["Form 16 pwd: 02-04-1987", "born 1962-11-07", "DOB 2 April 1987", "DOB April 2, 1987", "on 21-Aug-2026"]) {
   const m = mask(d);
-  assert.match(m, /\[DATE\]/, d);
+  assert.match(m, /\[(?:DATE|SECRET)\]/, d);
   assert.doesNotMatch(m, /1987|1962|2026/, d);
 }
 assert.doesNotMatch(mask("Please confirm 2026-08-21.", { dates: false }), /\[/);
 assert.match(mask("Please confirm 2026-08-21.", { dates: false }) , /2026-08-21/);
+
+// --- finance identifiers
+{
+  const cases = [
+    ["savings account number is 50100234567891", "ACCOUNT", "50100234567891"],
+    ["a/c 5010 0234 5678 91 at Axis", "ACCOUNT", "5678 91"],
+    ["Demat account: IN30012310234567", "DEMAT", "30012310234567"],
+    ["DP ID 12081600", "DEMAT", "12081600"],
+    ["folio no 1234567/89", "FOLIO", "1234567/89"],
+    ["LIC policy number 123456789", "POLICY", "123456789"],
+    ["Passport number K1234567", "ID", "K1234567"],
+    ["voter ID ABC1234567", "ID", "ABC1234567"],
+    ["Aadhaar no 1234 1234 1234", "AADHAAR", "1234 1234"],
+    ["The password is Hunter2! ok", "SECRET", "Hunter2"],
+    ["OTP is 482913.", "SECRET", "482913"],
+    ["Amex 3782 822463 10005", "CARD", "10005"],
+    ["TAN MUMA12345B", "TAN", "MUMA12345B"],
+    ["Card 4111 1111 1111 1111", "CARD", "4111"],
+  ];
+  for (const [text, type, leak] of cases) {
+    const m = mask(text);
+    assert.match(m, new RegExp(`\\[${type}\\]`), text);
+    assert.ok(!m.includes(leak), `${text} leaked ${leak}: ${m}`);
+  }
+  for (const ok of ["pin code 400053 is Mumbai", "NIFTY closed at 22000 and the account was closed", "Transfer 50000 rupees by NEFT", "The password policy will change"])
+    assert.strictEqual(mask(ok), ok, ok);
+}
 
 // --- redactor with a fake detector standing in for Needle
 const fake = {
@@ -92,6 +119,33 @@ const fake = {
   assert.deepStrictEqual(chunkText("Regards,\nAnita Desai\nA much longer sentence follows here, with enough words to stand alone as its own chunk entirely."), ["Regards, Anita Desai", "A much longer sentence follows here, with enough words to stand alone as its own chunk entirely."]);
 }
 
+// --- finance kinds from the model: typed, grounded, and never a kept date
+{
+  const det = {
+    findPerson: async () => null,
+    findAddress: async () => null,
+    findAccount: async (t) => (t.includes("LIC/0034/998877") ? "Policy LIC/0034/998877" : t.includes("2026-08-21") ? "2026-08-21" : null),
+    findId: async (t) => (t.includes("ZX-AB-99812") ? "ZX-AB-99812" : null),
+    findSecret: async (t) => (t.includes("sunshine99") ? "sunshine99" : null),
+  };
+  const r = new Redactor({ dates: false, detector: det });
+  const doc = "Policy LIC/0034/998877 matures. ZX-AB-99812 is my licence. Login pass sunshine99 works. Call on 2026-08-21.";
+  await r.learn([doc]);
+  const out = r.apply(doc);
+  assert.doesNotMatch(out, /LIC\/0034|ZX-AB|sunshine99/);
+  assert.match(out, /\[ACCOUNT\]/);
+  assert.match(out, /\[ID\]/);
+  assert.match(out, /\[SECRET\]/);
+  assert.match(out, /2026-08-21/, "a date the user chose to keep must stay");
+}
+// A phrase reported as an ID must not shadow the address it came from.
+{
+  const doc = "Registered address: Flat 12B, Sunrise Apartments, Andheri West, Mumbai 400053.";
+  const det = { findPerson: async () => null, findAddress: async () => "Flat 12B, Sunrise Apartments, Andheri West, Mumbai 400053", findAccount: async () => null, findId: async () => "Flat 12B, Sunrise Apartments, Andheri West, Mumbai 400053" };
+  const r = new Redactor({ detector: det });
+  await r.learn([doc]);
+  assert.strictEqual(r.apply(doc), "Registered address: [ADDRESS].");
+}
 // --- cue names work with no AI at all
 {
   const r = new Redactor();

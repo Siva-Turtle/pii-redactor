@@ -11,21 +11,64 @@ const MONTHS =
 
 const digitCount = (s) => s.replace(/\D/g, "").length;
 
+// A number/ID value that follows a label, e.g. "a/c 5010 0234 5678", "folio no 1234567/89".
+// Up to 4 letters then a digit, then digits/letters/-/ and up to three more space-separated groups.
+const VALUE = "((?:[A-Z]{0,4}\\d[A-Z0-9/-]*)(?:[ ]\\d[A-Z0-9/-]*){0,3})";
+const SEP = "(?:[ \\t]*(?:no\\.?|number|num|id|#))?[ \\t]*[:=\\-\u2013]?[ \\t]*(?:is|was)?[ \\t]*";
+const labelled = (labels) => new RegExp(`\\b(?:${labels})${SEP}${VALUE}`, "gid");
+const hasEnoughDigits = (m) => m.replace(/\D/g, "").length >= 5;
+export const NOT_A_SECRET = /^(?:protected|required|reset|policy|will|has|to|for|the|and|is|was|not|only|code|number|sent|received|expired)$/i;
+
 export const RULES = [
   { type: "EMAIL", re: /[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}/g },
   // UPI handle such as name@oksbi (no dot after the @, so EMAIL skips it).
   { type: "UPI", re: /\b[\w.-]{2,}@[a-z]{2,}\b/gi },
+  // Passwords, PINs, OTPs, CVVs: the value after the word. DOBs are often used
+  // as passwords ("pwd: 02-04-1987"), so this runs before DATE.
+  {
+    type: "SECRET",
+    group: 1,
+    re: /\b(?:password|passwd|pwd|pw|passcode|pin|otp|cvv2?|cvc)\b(?!\s+code)[ \t]*(?:is|was|:|=|-|\u2013)?[ \t]*(?:is)?[ \t]*([^\s,;]{3,40}?)(?=[.,;]?(?:\s|$))/gid,
+    accept: (m) => !NOT_A_SECRET.test(m),
+  },
   { type: "GSTIN", re: /\b\d{2}[A-Z]{5}\d{4}[A-Z][1-9A-Z]Z[0-9A-Z]\b/g },
   { type: "PAN", re: /\b[A-Z]{5}[0-9]{4}[A-Z]\b/g },
+  { type: "TAN", re: /\b[A-Z]{4}[0-9]{5}[A-Z]\b/g },
   // Bank IFSC: 4 letters, literal 0, 6 alphanumeric (e.g. HDFC0001234).
   { type: "IFSC", re: /\b[A-Z]{4}0[A-Z0-9]{6}\b/gi },
+  // NSDL demat (BO) ID: "IN" + 6-digit DP ID + 8-digit client ID, e.g. IN300123 10234567.
+  { type: "DEMAT", re: /\bIN\d{6}[ -]?\d{8}\b/g },
   { type: "IP", re: /\b(?:\d{1,3}\.){3}\d{1,3}\b/g },
-  // 16-digit card, optionally grouped in 4s. Must precede SSN/AADHAAR/PHONE.
+  // Labelled numbers. The label decides the type; only the value is hidden.
+  { type: "AADHAAR", group: 1, re: labelled("aadhaar|aadhar|uidai|uid"), accept: (m) => digitCount(m) >= 12 },
+  { type: "SSN", group: 1, re: labelled("ssn|social security(?: number)?"), accept: (m) => digitCount(m) >= 9 },
+  { type: "CARD", group: 1, re: labelled("(?:credit |debit )?card"), accept: (m) => digitCount(m) >= 13 },
+  { type: "DEMAT", group: 1, re: labelled("demat(?: a\\/c| account)?|bo[ -]?id|dp[ -]?id|client[ -]?id|beneficiary(?: owner)? id"), accept: hasEnoughDigits },
+  { type: "FOLIO", group: 1, re: labelled("folio"), accept: hasEnoughDigits },
+  { type: "POLICY", group: 1, re: labelled("policy|pran|uan|ckyc|nps"), accept: hasEnoughDigits },
+  {
+    type: "ID",
+    group: 1,
+    re: labelled("passport|voter(?: id)?|epic|driving licen[cs]e|itin|ein|gstin|pan|tan"),
+    accept: hasEnoughDigits,
+  },
+  {
+    type: "ACCOUNT",
+    group: 1,
+    re: labelled(
+      "a\\/c|acct|account|savings|current account|salary account|loan(?: account)?|customer id|cif|cheque|micr|routing|aba|sort code|utr",
+    ),
+    accept: hasEnoughDigits,
+  },
+  // 16-digit card, optionally grouped in 4s; AMEX is 15 (4-6-5). Must precede SSN/AADHAAR/PHONE.
   { type: "CARD", re: /\b(?:\d{4}[ -]?){3}\d{4}\b/g },
+  { type: "CARD", re: /\b3[47]\d{2}[ -]?\d{6}[ -]?\d{5}\b/g },
   // US SSN 3-2-4. Must precede AADHAAR, which is looser.
   { type: "SSN", re: /\b\d{3}[ -]\d{2}[ -]\d{4}\b/g },
+  // Voter ID (EPIC): 3 letters + 7 digits.
+  { type: "ID", re: /\b[A-Z]{3}\d{7}\b/g },
   { type: "AADHAAR", re: /\b(?:\d{4}[ -]?){2}\d{4}\b/g },
-  // Long bank account numbers. Must precede PHONE, which would eat the first 15 digits.
+  // Long bank account numbers with no label. Must precede PHONE, which would eat the first 15 digits.
   { type: "ACCOUNT", re: /\b\d{15,18}\b/g },
   // Dates (DOBs double as passwords on Form 16 / bank statements, so they are
   // PII). Toggleable because ordinary calendar dates are masked too.
@@ -66,9 +109,8 @@ export function findPatternSpans(text, { dates = true } = {}) {
     const silent = rule.optional === "dates" && !dates;
     rule.re.lastIndex = 0;
     for (const m of text.matchAll(rule.re)) {
-      const start = m.index;
-      const end = start + m[0].length;
-      if (rule.accept && !rule.accept(m[0])) continue;
+      const [start, end] = rule.group ? m.indices[rule.group] : [m.index, m.index + m[0].length];
+      if (rule.accept && !rule.accept(text.slice(start, end))) continue;
       let free = true;
       for (let i = start; i < end; i++) {
         if (taken[i]) {

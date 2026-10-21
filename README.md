@@ -29,19 +29,26 @@ machines; the start file tells you if it is missing). Windows needs nothing extr
 > **Always glance over the result before sharing it.** No automatic tool catches everything — see
 > "What it can and cannot do".
 
-## What gets hidden
+## What gets hidden (finance-focused)
 
 Two layers work together, and both are local:
 
-1. **Pattern layer** (`js/patterns.js`, ported from the CRM's `backend/utils/piiMasking.js`) — emails, UPI IDs,
-   phone numbers, PAN, Aadhaar, GSTIN, IFSC, US SSN, card numbers, long account numbers, IP addresses, and
-   dates (birth dates double as passwords on Form 16s and bank statements; there is an option to keep dates).
+1. **Pattern layer** (`js/patterns.js`, grown from the CRM's `backend/utils/piiMasking.js`). Exact formats:
+   **PAN, Aadhaar, phone, email**, UPI IDs, GSTIN, TAN, IFSC, NSDL demat IDs (`IN300123 10234567`), voter ID,
+   credit/debit cards (incl. Amex), US SSN, 15–18-digit account numbers, IP addresses, and dates (birth dates
+   double as passwords on Form 16s and statements; there is an option to keep dates).
+   **Labelled values** are caught by their label, whatever their format: `a/c`, `account no`, `savings`,
+   `loan`, `cheque`, `routing`, `demat`, `DP ID`, `client ID`, `folio`, `policy`, `PRAN`, `UAN`, `CKYC`,
+   `passport`, `Aadhaar`, `SSN`, `card`, and `password / PIN / OTP / CVV is …`.
 2. **AI layer** (`js/ai.js`) — [Cactus Needle 3](https://cactuscompute.com/needle), a ~35 MB model running via
-   WebAssembly, finds **names** and **postal addresses**. Plus cheap deterministic cues that work even with the AI
-   off: `Mr./Dr. X`, `Dear X`, sign-offs (`Regards, X`), `spouse X`, `Name: X`. Every name found is hidden
-   *everywhere* in that file, including first-name-only mentions.
-3. **Spreadsheets/CSV:** columns whose header says *name, email, phone, mobile, DOB, address, PAN, Aadhaar,
-   account no…* are hidden whole; free-text columns go through the two layers above.
+   WebAssembly. It is asked five narrow questions per sentence (only the relevant ones): *person name*, *address*,
+   *bank / demat / folio / policy / loan number*, *government or tax ID*, *password / PIN / OTP / username*. It
+   finds what patterns cannot: an unlabelled `LIC/0034/998877`, a plain-word password, a name in prose, an address.
+   Every answer is checked against the text (it can never invent something to hide), then hidden **everywhere**
+   in that file. Cheap deterministic name cues also work with the AI off: `Mr./Dr. X`, `Dear X`,
+   `Regards, X`, `spouse X`, `Name: X`.
+3. **Spreadsheets/CSV:** columns whose header says *name, email, phone, DOB, address, PAN, Aadhaar, account,
+   demat, folio, policy, password…* are hidden whole; other cells go through the two layers above.
 
 | File | What you get back |
 |---|---|
@@ -54,10 +61,10 @@ Two layers work together, and both are local:
 ## What it can and cannot do (please read)
 
 - **Needle is a tool-calling model, not a purpose-built PII/NER model.** We drive it with one narrow tool per
-  question ("find a person", "find an address") because that was far more reliable than several at once. In our
-  tests it found names well in ordinary sentences but is **not guaranteed** to catch every name — unusual names,
-  names in all-caps lists, or names in cluttered text can slip through. A company/organisation question performed
-  poorly, so organisations are *not* hidden.
+  question because that was far more reliable than several at once. It tends to over-report (safe for
+  redaction) and sometimes labels a hit with the wrong type, but it is **not guaranteed** to catch everything —
+  unusual names, all-caps lists, or cluttered text can slip through. A company/organisation question performed
+  poorly, so organisations are *not* hidden. Fixed-format finance IDs rely on the pattern layer, which is exact.
 - Patterns are exact; the AI is probabilistic. Treat the output as a strong first pass, then skim it.
 - **Scanned PDFs / pictures** (no selectable text) can't be read. PDFs like this are rejected with a message
   rather than returned unredacted. Text inside images embedded in Word/PDF files is not read.
@@ -91,7 +98,7 @@ tools/update-vendor.sh   re-fetch vendor/ (pins the model revision + SHA-256)
 node test/unit.mjs                         # pattern/redactor/CSV tests (no browser)
 
 # end-to-end (needs Playwright + Chromium): generates fake-data fixtures, drives the real page
-node test/make-fixtures.mjs
+node test/make-fixtures.mjs                # also writes finance.txt, a finance-heavy sample
 python3 serve.py --no-browser &            # http://localhost:8731
 node test/e2e.cjs http://localhost:8731/   # all formats, AI on
 node test/e2e.cjs http://localhost:8731/ mixed.pdf && node test/pixel-check.cjs   # PDF boxes fully cover PII
