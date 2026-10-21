@@ -5,6 +5,12 @@
 
 import { parseCsv, stringifyCsv, detectDelimiter } from "./csv.js";
 import { labelFor } from "./patterns.js";
+import {
+  unlockOffice,
+  detectOfficeEncryption,
+  WrongPasswordError,
+  UnsupportedEncryptionError,
+} from "./office-crypto.js";
 
 // Thorough mode costs roughly 10 s per paragraph, so the AI pass is time-boxed per file.
 const AI_TIME_BUDGET_MS = 10 * 60 * 1000;
@@ -12,6 +18,64 @@ const AI_TIME_BUDGET_MS = 10 * 60 * 1000;
 export const SUPPORTED = ["pdf", "xlsx", "xls", "csv", "txt", "md", "docx"];
 
 export const extOf = (name) => (name.split(".").pop() || "").toLowerCase();
+
+// ------------------------------------------------------------------ passwords
+// A locked file never goes through the redaction queue until the user unlocks
+// it (see app.js). detectLock classifies a freshly dropped file:
+//   { kind: "open" }                                    normal path
+//   { kind: "locked", format: "pdf"|"office", bytes }   show the password box
+//   { kind: "unsupported", message }                     explain, no retry
+// bytes are returned only for locked files, so the unlock step can proceed
+// without re-reading the disk and the password need never touch the queue.
+export async function detectLock(file) {
+  const ext = extOf(file.name);
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  if (ext === "pdf") {
+    const lib = await loadPdfjs();
+    try {
+      const doc = await lib.getDocument({ data: bytes, isEvalSupported: false }).promise;
+      await doc.destroy();
+      return { kind: "open" };
+    } catch (err) {
+      if (err instanceof NeedsPasswordError || err?.name === "PasswordException") return { kind: "locked", format: "pdf", bytes };
+      return { kind: "open" }; // damaged etc: the normal path reports it kindly
+    }
+  }
+  if (ext === "docx" || ext === "xlsx" || ext === "xls" || ext === "doc") {
+    const kind = detectOfficeEncryption(bytes, ext);
+    if (kind === "agile") return { kind: "locked", format: "office", bytes };
+    if (kind === "standard" || kind === "extensible") {
+      return {
+        kind: "unsupported",
+        message:
+          "This file uses an older kind of Office password protection that this tool can't open. " +
+          "Open it in Word or Excel and re-save it without a password, then drop it in again.",
+      };
+    }
+    if (kind === "legacy") {
+      return {
+        kind: "unsupported",
+        message:
+          "This is a very old Word/Excel 97–2003 file with password protection, which this tool can't open. " +
+          "Open it in Word or Excel and save it as .docx/.xlsx without a password, then drop it in again.",
+      };
+    }
+    return { kind: "open" };
+  }
+  return { kind: "open" };
+}
+
+// Unlock an Office file's bytes with the user's password (sync; ~1 s for the
+// 100000-round key check). Throws WrongPasswordError on a bad password.
+function unlockedFile(file, bytes, password) {
+  const zip = unlockOffice(bytes, password);
+  return { name: file.name, arrayBuffer: async () => zip };
+}
+
+const OFFICE_MIME = {
+  docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+};
 
 function outName(name, ext) {
   const base = name.replace(/\.[^.]+$/, "");
@@ -67,13 +131,30 @@ async function learnWithBudget(redactor, texts, status, warnings) {
   }
 }
 
+// WHY one helper for all formats: Redactor.report entries are created without
+// a location; each handler stamps the entries its own step just added.
+function tagReport(redactor, base, location, page = "") {
+  for (let i = base; i < redactor.report.length; i++) {
+    if (!redactor.report[i].location) redactor.report[i].location = location;
+    if (!redactor.report[i].page && page !== "") redactor.report[i].page = page;
+  }
+}
+
+const lineOf = (text, index) => text.slice(0, index).split("\n").length;
+
 // ---------------------------------------------------------------- text / md
 async function redactText(file, redactor, status, ext) {
   const text = new TextDecoder("utf-8", { ignoreBOM: true }).decode(await file.arrayBuffer());
   const warnings = [];
   await learnWithBudget(redactor, [text], status, warnings);
+  const base = redactor.report.length;
   const out = redactor.apply(text);
-  return { blob: new Blob([out], { type: "text/plain" }), name: outName(file.name, ext), warnings };
+  for (let i = base; i < redactor.report.length; i++) {
+    const e = redactor.report[i];
+    e.location = `line ${e.start != null ? lineOf(text, e.start) : 1}`;
+    e.page = "";
+  }
+  return { blob: new Blob([out], { type: "text/plain" }), name: outName(file.name, ext), warnings, report: redactor.report.slice() };
 }
 
 // --------------------------------------------------------------------- csv
@@ -95,22 +176,51 @@ async function redactCsv(file, redactor, status) {
   await learnWithBudget(redactor, rows.map((row, r) => (r === headRow ? "" : rowText(row))), status, warnings);
 
   // Rows above the header are titles: they still go through the patterns/AI.
-  const out = rows.map((row, r) =>
-    r === headRow
-      ? row
-      : row.map((cell, c) => (r > headRow && hidden[c] ? redactor.hideAs(hidden[c], cell) : redactor.apply(cell))),
-  );
+  const headNames = rows[headRow] || [];
+  const out = rows.map((row, r) => {
+    if (r === headRow) return row;
+    return row.map((cell, c) => {
+      const header = headNames[c] ?? "";
+      const loc = r > headRow && header
+        ? `row ${r + 1}, column "${header}"`
+        : `row ${r + 1}, column ${c + 1}`;
+      if (r > headRow && hidden[c]) {
+        const base = redactor.report.length;
+        const outCell = cell ? redactor.hideAs(hidden[c], cell, header) : cell;
+        tagReport(redactor, base, loc);
+        return outCell;
+      }
+      const base = redactor.report.length;
+      const outCell = redactor.apply(cell);
+      tagReport(redactor, base, loc);
+      return outCell;
+    });
+  });
   const hiddenCols = (rows[headRow] || []).filter((_, c) => hidden[c]);
   if (hiddenCols.length) warnings.push(`Hid whole columns: ${hiddenCols.join(", ")}.`);
   return {
     blob: new Blob([bom + stringifyCsv(out, delimiter, eol)], { type: "text/csv" }),
     name: outName(file.name, "csv"),
     warnings,
+    report: redactor.report.slice(),
   };
 }
 
 // -------------------------------------------------------------------- xlsx
-async function redactXlsx(file, redactor, status) {
+async function redactXlsx(file, redactor, status, opts = {}) {
+  if (opts.password) {
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    if (opts.onlyUnlock) {
+      const zip = unlockOffice(bytes, opts.password);
+      return {
+        blob: new Blob([zip], { type: OFFICE_MIME.xlsx }),
+        name: file.name,
+        warnings: ["Password removed. The file is otherwise unchanged.", "Report is empty: only the password was removed, nothing was hidden."],
+        report: [],
+      };
+    }
+    file = unlockedFile(file, bytes, opts.password);
+  }
   const wb = XLSX.read(await file.arrayBuffer(), { type: "array", cellStyles: true });
   const warnings = [];
   const plan = [];
@@ -141,7 +251,12 @@ async function redactXlsx(file, redactor, status) {
         if (!cell) continue;
         const asText = String(cell.w ?? cell.v ?? "");
         const isHeaderRow = r === headR;
-        plan.push({ cell, asText, hidden: r > headR ? hidden[c] : null, isHeaderRow });
+        plan.push({
+          cell, asText,
+          hidden: r > headR ? hidden[c] : null,
+          header: r > headR ? textAt(headR, c) : "",
+          sheetName, addr, isHeaderRow,
+        });
         if (!isHeaderRow && !(r > headR && hidden[c]) && /\p{L}{3,}/u.test(asText)) rowBits.push(asText);
         if (cell.c) delete cell.c; // cell comments can hold names
         if (cell.l) delete cell.l; // hyperlinks can hold mailto: addresses
@@ -159,12 +274,21 @@ async function redactXlsx(file, redactor, status) {
 
   await learnWithBudget(redactor, learnTexts, status, warnings);
 
-  for (const { cell, asText, hidden } of plan) {
+  for (const { cell, asText, hidden, header, sheetName, addr } of plan) {
+    const loc = `${sheetName}!${addr}`;
     let replacement = null;
     if (hidden) {
-      replacement = asText ? redactor.hideAs(hidden, asText) : null;
+      if (asText) {
+        const base = redactor.report.length;
+        replacement = redactor.hideAs(hidden, asText, header);
+        tagReport(redactor, base, loc);
+      } else {
+        replacement = null;
+      }
     } else {
+      const base = redactor.report.length;
       const redacted = redactor.apply(asText);
+      tagReport(redactor, base, loc);
       if (redacted !== asText) replacement = redacted;
     }
     if (replacement !== null) {
@@ -182,6 +306,7 @@ async function redactXlsx(file, redactor, status) {
     blob: new Blob([out], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" }),
     name: outName(file.name, "xlsx"),
     warnings,
+    report: redactor.report.slice(),
   };
 }
 
@@ -213,7 +338,40 @@ function applySpansToRuns(nodes, spans) {
   }
 }
 
-async function redactDocx(file, redactor, status) {
+function partLabel(name) {
+  if (/header\d*\.xml$/.test(name)) return "header";
+  if (/footer\d*\.xml$/.test(name)) return "footer";
+  if (/footnotes\.xml$/.test(name)) return "footnote";
+  if (/endnotes\.xml$/.test(name)) return "endnote";
+  if (/comments\.xml$/.test(name)) return "comment";
+  return "body";
+}
+
+function siblingIndex(el, tag) {
+  let n = 0;
+  for (let s = el.parentNode?.firstChild; s; s = s.nextSibling) {
+    if (s.nodeType === 1 && s.nodeName === tag) {
+      n++;
+      if (s === el) return n;
+    }
+  }
+  return n || 1;
+}
+
+async function redactDocx(file, redactor, status, opts = {}) {
+  if (opts.password) {
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    if (opts.onlyUnlock) {
+      const zip = unlockOffice(bytes, opts.password);
+      return {
+        blob: new Blob([zip], { type: OFFICE_MIME.docx }),
+        name: file.name,
+        warnings: ["Password removed. The file is otherwise unchanged.", "Report is empty: only the password was removed, nothing was hidden."],
+        report: [],
+      };
+    }
+    file = unlockedFile(file, bytes, opts.password);
+  }
   const zip = await JSZip.loadAsync(await file.arrayBuffer());
   const warnings = [];
   const parser = new DOMParser();
@@ -224,7 +382,9 @@ async function redactDocx(file, redactor, status) {
   }
 
   const paragraphs = [];
-  for (const { doc } of docs) {
+  const paraLocByEl = new Map();
+  for (const { name, doc } of docs) {
+    const part = partLabel(name);
     const byPara = new Map();
     for (const t of doc.getElementsByTagName("w:t")) {
       const p = closest(t, "w:p");
@@ -232,7 +392,16 @@ async function redactDocx(file, redactor, status) {
       if (!byPara.has(p)) byPara.set(p, []);
       byPara.get(p).push(t);
     }
-    for (const els of byPara.values()) {
+    // Table numbering within this part, in document order.
+    const tblIndex = new Map();
+    let tblCount = 0;
+    for (const tbl of doc.getElementsByTagName("w:tbl")) {
+      tblCount++;
+      tblIndex.set(tbl, tblCount);
+    }
+    let paraNo = 0;
+    for (const [pEl, els] of byPara.entries()) {
+      paraNo++;
       let cursor = 0;
       const nodes = els.map((el) => {
         const text = el.textContent;
@@ -240,7 +409,17 @@ async function redactDocx(file, redactor, status) {
         cursor = n.end;
         return n;
       });
-      paragraphs.push({ nodes, text: nodes.map((n) => n.text).join("") });
+      const tbl = closest(pEl, "w:tbl");
+      let location;
+      if (tbl) {
+        const tr = closest(pEl, "w:tr");
+        const tc = closest(pEl, "w:tc");
+        location = `${part}, table ${tblIndex.get(tbl) || 1}, row ${tr ? siblingIndex(tr, "w:tr") : 1}, cell ${tc ? siblingIndex(tc, "w:tc") : 1}`;
+      } else {
+        location = `${part}, paragraph ${paraNo}`;
+      }
+      paraLocByEl.set(pEl, location);
+      paragraphs.push({ nodes, text: nodes.map((n) => n.text).join(""), location, pEl, part });
     }
   }
 
@@ -249,11 +428,22 @@ async function redactDocx(file, redactor, status) {
   for (const p of paragraphs) {
     const spans = redactor.spans(p.text);
     if (!spans.length) continue;
-    redactor.count(spans);
+    // WHY one count() per paragraph (not per run): a name split across runs
+    // ("Priya Na"+"ir") is a single span with the full quote.
+    const base = redactor.report.length;
+    redactor.count(spans, p.text);
+    tagReport(redactor, base, p.location);
     applySpansToRuns(p.nodes, spans);
   }
   for (const { name, doc } of docs) {
-    for (const el of doc.getElementsByTagName("w:instrText")) el.textContent = redactor.apply(el.textContent);
+    const part = partLabel(name);
+    for (const el of doc.getElementsByTagName("w:instrText")) {
+      const base = redactor.report.length;
+      const pEl = closest(el, "w:p");
+      const loc = pEl && paraLocByEl.get(pEl) ? `${paraLocByEl.get(pEl)}, field` : `${part}, field`;
+      el.textContent = redactor.apply(el.textContent);
+      tagReport(redactor, base, loc);
+    }
     if (name === "word/comments.xml") {
       for (const c of doc.getElementsByTagName("w:comment")) {
         c.setAttribute("w:author", "Redacted");
@@ -270,10 +460,15 @@ async function redactDocx(file, redactor, status) {
     let changed = false;
     for (const rel of doc.getElementsByTagName("Relationship")) {
       const target = rel.getAttribute("Target") || "";
-      if (rel.getAttribute("TargetMode") === "External" && redactor.spans(target).length) {
-        redactor.count(redactor.spans(target));
-        rel.setAttribute("Target", "#redacted");
-        changed = true;
+      if (rel.getAttribute("TargetMode") === "External" && target) {
+        const spans = redactor.spans(target);
+        if (spans.length) {
+          const base = redactor.report.length;
+          redactor.count(spans, target);
+          tagReport(redactor, base, "hyperlink");
+          rel.setAttribute("Target", "#redacted");
+          changed = true;
+        }
       }
     }
     if (changed) zip.file(name, new XMLSerializer().serializeToString(doc));
@@ -290,12 +485,13 @@ async function redactDocx(file, redactor, status) {
 
   if (Object.keys(zip.files).some((n) => n.startsWith("word/media/")))
     warnings.push("This document contains pictures. Text inside pictures is not read or hidden.");
+  warnings.push("Word files don't store page numbers, so locations below are paragraphs, tables, headers, footers, comments or footnotes — not pages.");
   const blob = await zip.generateAsync({
     type: "blob",
     mimeType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     compression: "DEFLATE",
   });
-  return { blob, name: outName(file.name, "docx"), warnings };
+  return { blob, name: outName(file.name, "docx"), warnings, report: redactor.report.slice() };
 }
 
 // --------------------------------------------------------------------- pdf
@@ -333,10 +529,18 @@ function pageText(content, viewport, Util) {
   return { text, entries };
 }
 
-async function redactPdf(file, redactor, status) {
+async function redactPdf(file, redactor, status, opts = {}) {
   const lib = await loadPdfjs();
   const warnings = [];
-  const src = await lib.getDocument({ data: new Uint8Array(await file.arrayBuffer()), isEvalSupported: false }).promise;
+  let src;
+  try {
+    src = await lib.getDocument({ data: new Uint8Array(await file.arrayBuffer()), password: opts.password || "", isEvalSupported: false }).promise;
+  } catch (err) {
+    // pdf.js rejects with PasswordException both when no password was given
+    // (needs the unlock UI) and when the given one is wrong (retry message).
+    if (err?.name === "PasswordException") throw opts.password ? new WrongPasswordError() : new NeedsPasswordError();
+    throw err;
+  }
   const pages = [];
   for (let i = 1; i <= src.numPages; i++) {
     const page = await src.getPage(i);
@@ -346,7 +550,11 @@ async function redactPdf(file, redactor, status) {
     pages.push({ page, text, entries });
   }
   const chars = pages.reduce((n, p) => n + p.text.replace(/\s/g, "").length, 0);
-  if (chars < 20) {
+  // "Only remove the password": return the pages as pictures, with no black
+  // boxes. The password is gone but so is selectable text; say so plainly.
+  // (A scanned PDF is still a faithful copy in this mode, so it is returned.)
+  const onlyUnlock = !!opts.onlyUnlock;
+  if (chars < 20 && !onlyUnlock) {
     throw new FriendlyError(
       "This PDF looks like a scan (a picture of a page), so there is no text to find. " +
         "Run it through OCR first, then try again.",
@@ -356,12 +564,13 @@ async function redactPdf(file, redactor, status) {
   if (blank)
     warnings.push(`${blank} page(s) have no readable text (pictures only). They were copied as-is, so please check them by eye.`);
 
-  await learnWithBudget(redactor, pages.map((p) => p.text), status, warnings);
+  if (onlyUnlock) warnings.push("Password removed. Pages are saved as pictures, so the text in this PDF can no longer be selected.");
+  else await learnWithBudget(redactor, pages.map((p) => p.text), status, warnings);
 
   const measure = document.createElement("canvas").getContext("2d");
   const out = await PDFLib.PDFDocument.create();
   for (let i = 0; i < pages.length; i++) {
-    status(`Redacting page ${i + 1} of ${pages.length}…`);
+    status(`${onlyUnlock ? "Copying" : "Redacting"} page ${i + 1} of ${pages.length}…`);
     const { page, text } = pages[i];
     const unit = page.getViewport({ scale: 1 });
     const scale = Math.min(2, Math.sqrt(16_000_000 / (unit.width * unit.height)));
@@ -375,11 +584,21 @@ async function redactPdf(file, redactor, status) {
     await page.render({ canvasContext: ctx, viewport }).promise;
 
     // Positions must come from the SAME viewport the canvas is drawn with.
-    const scaled = pageText(await page.getTextContent(), viewport, lib.Util);
-    const spans = redactor.spans(scaled.text);
-    redactor.count(spans);
-    ctx.fillStyle = "#000";
-    for (const sp of spans) {
+    // WHY record here (not in the learn pass above): the page text is built
+    // twice, and counting both would list everything twice.
+    if (!onlyUnlock) {
+      const scaled = pageText(await page.getTextContent(), viewport, lib.Util);
+      const spans = redactor.spans(scaled.text);
+      const base = redactor.report.length;
+      redactor.count(spans, scaled.text);
+      const pageNo = String(i + 1);
+      for (let k = base; k < redactor.report.length; k++) {
+        const e = redactor.report[k];
+        e.page = pageNo;
+        e.location = `page ${pageNo}, line ${e.start != null ? lineOf(scaled.text, e.start) : 1}`;
+      }
+      ctx.fillStyle = "#000";
+      for (const sp of spans) {
       for (const e of scaled.entries) {
         const len = e.end - e.start;
         if (!len || sp.end <= e.start || sp.start >= e.end) continue;
@@ -403,6 +622,7 @@ async function redactPdf(file, redactor, status) {
         ctx.fillRect(u0, -0.28, u1 - u0, 1.2);
         ctx.restore();
       }
+      }
     }
     const jpg = await new Promise((res) => canvas.toBlob(res, "image/jpeg", 0.85));
     const img = await out.embedJpg(new Uint8Array(await jpg.arrayBuffer()));
@@ -410,15 +630,35 @@ async function redactPdf(file, redactor, status) {
     pdfPage.drawImage(img, { x: 0, y: 0, width: unit.width, height: unit.height });
     page.cleanup();
   }
-  warnings.push("Pages are saved as pictures with black boxes, so the text in this PDF can no longer be selected.");
-  return { blob: new Blob([await out.save()], { type: "application/pdf" }), name: outName(file.name, "pdf"), warnings };
+  if (!onlyUnlock) warnings.push("Pages are saved as pictures with black boxes, so the text in this PDF can no longer be selected.");
+  const name = onlyUnlock ? file.name : outName(file.name, "pdf");
+  if (onlyUnlock) {
+    warnings.push("Report is empty: only the password was removed, nothing was hidden.");
+  }
+  return { blob: new Blob([await out.save()], { type: "application/pdf" }), name, warnings, report: onlyUnlock ? [] : redactor.report.slice() };
 }
 
 // ------------------------------------------------------------------- entry
 class FriendlyError extends Error {}
+// Internal only: the file needs a password before anything can be done.
+// app.js turns this into the inline password box, never an error message.
+export class NeedsPasswordError extends Error {}
 
 function friendly(err, ext) {
   if (err instanceof FriendlyError) return err;
+  if (err instanceof NeedsPasswordError) return err;
+  if (err instanceof WrongPasswordError) {
+    // WHY a code, not message matching: app.js must tell "wrong password,
+    // try again" apart from fatal errors without parsing English sentences.
+    const out = new FriendlyError("That password didn't work. Check it and try again — caps lock catches everyone out.");
+    out.code = "wrong-password";
+    return out;
+  }
+  if (err instanceof UnsupportedEncryptionError)
+    return new FriendlyError(
+      "This file uses an older kind of Office password protection that this tool can't open. " +
+        "Open it in Word or Excel and re-save it without a password, then drop it in again.",
+    );
   const text = `${err?.name || ""} ${err?.message || ""}`;
   if (/password/i.test(text))
     return new FriendlyError("This file is protected with a password. Remove the password first, then try again.");
@@ -427,7 +667,7 @@ function friendly(err, ext) {
     return new FriendlyError(`This doesn't look like a valid ${kind} file, or it is damaged. Try opening and re-saving it, then drop it in again.`);
   return err;
 }
-export async function redactFile(file, redactor, status) {
+export async function redactFile(file, redactor, status, opts = {}) {
   redactor.resetFile();
   const ext = extOf(file.name);
   try {
@@ -439,11 +679,11 @@ export async function redactFile(file, redactor, status) {
         return await redactCsv(file, redactor, status);
       case "xlsx":
       case "xls":
-        return await redactXlsx(file, redactor, status);
+        return await redactXlsx(file, redactor, status, opts);
       case "docx":
-        return await redactDocx(file, redactor, status);
+        return await redactDocx(file, redactor, status, opts);
       case "pdf":
-        return await redactPdf(file, redactor, status);
+        return await redactPdf(file, redactor, status, opts);
       default:
         throw new FriendlyError(`.${ext} files are not supported. Try PDF, Word (.docx), Excel, CSV, text or Markdown.`);
     }

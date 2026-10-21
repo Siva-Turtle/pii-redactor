@@ -75,6 +75,50 @@ Two layers work together, and both are local:
 | `.docx` | formatting preserved; author metadata, comment authors and `mailto:` link targets cleared |
 | `.pdf` | pages redrawn with **solid black boxes**; the original text layer is dropped, so nothing can be copied out from under a box |
 
+## Redaction report
+
+Every finished file gets a collapsed **“What was hidden (N items)”** section: a compact table of
+location, type, the exact original quote, and who found it. A **“Download report (.csv)”** button on each
+card downloads the full list; **“Download all reports (.csv)”** next to *Download all as ZIP* downloads one
+combined CSV for every file.
+
+> **Keep the report private.** The report contains the ORIGINAL sensitive text that was hidden. Never send it
+> along with the redacted file. The downloadable CSV starts with the same warning. Reports live in memory
+> only (never stored, never sent anywhere) and are deliberately **not** included in *Download all as ZIP*.
+
+CSV columns: `file, location, page, type, quote, found_by, detail` (UTF-8 with BOM for Excel). Cells starting
+with `= + - @` (or tab/CR) get a leading apostrophe so Excel can't run them as formulas. `found_by` is one of
+`script` (pattern rule in `detail`), `script: name cue` (e.g. “Dear X”), `script: column header` (header text in
+`detail`), `you` (your manual-list entry in `detail`), `needle` (Cactus Needle question/run/variant in `detail`,
+e.g. `account, run 0, variant 0`; the first run that found a term is recorded, then the term is hidden everywhere).
+
+Locations by file type (Word files don't store page numbers, so no pages are invented):
+
+| File | Location |
+|---|---|
+| PDF | `page N, line M` (page is 1-based; `page` column holds N) |
+| XLSX/XLS | `Sheet!Cell` (e.g. `Clients!B7`) |
+| CSV | `row N, column "Header"` (row is the file row, 1-based) |
+| TXT/MD | `line N` |
+| DOCX | `body, paragraph N`, `body, table T, row R, cell C`, `header`/`footer`/`footnote`/`endnote`/`comment` paragraph, `hyperlink`, `field` |
+
+In *“Only remove the password”* mode the report is empty (with a note), because nothing was hidden.
+
+## Password-protected files
+
+Drop in a locked **PDF, `.docx` or `.xlsx`** and the card asks for its password instead of failing. Type it
+and press Enter (or click **Unlock**): the file is unlocked on this computer and goes through the normal
+checks, and the download is a plain unprotected file. A wrong password just says so — try again. While a
+file waits for its password, other files keep processing; nothing queues up behind it.
+
+*Options → "Only remove the password (don't hide anything)"* returns the unlocked file exactly as it is,
+with nothing hidden. For PDFs the pages are re-drawn as pictures (this tool's PDF output is always images),
+so the text can no longer be selected — the card says so.
+
+Very old protection can't be opened: Word/Excel 97–2003 files, and the pre-2013 "standard" Office
+encryption. The card tells you to re-save the file without a password and try again. The password itself
+is never saved, sent, logged or kept: it lives only until the file is processed, then the box is cleared.
+
 ## What it can and cannot do (please read)
 
 - **Needle is a tool-calling model, not a purpose-built PII/NER model.** We drive it with one narrow tool per
@@ -112,13 +156,17 @@ tools/update-vendor.sh   re-fetch vendor/ (pins the model revision + SHA-256)
 ```
 
 ```bash
-node test/unit.mjs                         # pattern/redactor/CSV tests (no browser)
+node test/unit.mjs                         # pattern/redactor/CSV/Office-crypto tests (no browser)
 
 # end-to-end (needs Playwright + Chromium): generates fake-data fixtures, drives the real page
 node test/make-fixtures.mjs                # also writes finance.txt, a finance-heavy sample
 python3 serve.py --no-browser &            # http://localhost:8731
 node test/e2e.cjs http://localhost:8731/   # all formats, AI on
 node test/e2e.cjs http://localhost:8731/ mixed.pdf && node test/pixel-check.cjs   # PDF boxes fully cover PII
+PW=$(npm root -g)/playwright NOAI=1 node test/e2e.cjs http://localhost:8731/ locked.pdf locked.docx locked.xlsx sample.txt
+                                           # password workflow: lock card, wrong-password retry, unlock, unencrypted downloads
+PW=$(npm root -g)/playwright NOAI=1 ONLYUNLOCK=1 node test/e2e.cjs http://localhost:8731/ locked.pdf locked.docx locked.xlsx
+                                           # "only remove the password" mode
 ```
 
 Why a local server at all? Browsers refuse to run WebAssembly workers from a double-clicked `file://` page, so

@@ -12,6 +12,14 @@ cp $N/cactus-needle/vendor/needle.wasm $V/needle/needle.wasm
 cp $N/cactus-needle/vendor/LICENSE $V/needle/LICENSE-needle
 cp $N/pdfjs-dist/build/pdf.min.mjs $N/pdfjs-dist/build/pdf.worker.min.mjs $V/pdfjs/
 cp $N/jszip/dist/jszip.min.js $N/xlsx/dist/xlsx.full.min.js $N/pdf-lib/dist/pdf-lib.min.js $V/
+# Sync SHA-512 + raw AES-CBC for Office password removal (js/office-crypto.js).
+# Only sha512 and cbc are bundled; the alias resolves noble's node crypto shim.
+cat > .noble-entry.mjs <<'EOF'
+export { sha512 } from "@noble/hashes/sha512";
+export { cbc } from "@noble/ciphers/aes";
+EOF
+npx esbuild .noble-entry.mjs --bundle --format=esm --minify --alias:@noble/hashes/crypto=./node_modules/@noble/hashes/esm/crypto.js --outfile=$V/noble-crypto.min.mjs
+rm .noble-entry.mjs
 # Model weights: pinned revision + checksum (same pin the cactus-needle package uses).
 REV=2ae11323dc000f5e70c49f7403efa6af12ba9e67
 SHA=c9d915eca282ed42d1a09b143b592adb4cc6744ffe2d294adf5cfc5548170c38

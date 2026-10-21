@@ -1,8 +1,19 @@
 // Run with: node test/unit.mjs
 import assert from "node:assert";
+import { existsSync, readFileSync } from "node:fs";
 import { findPatternSpans, applySpans } from "../js/patterns.js";
 import { Redactor, chunkText, cleanHit, parseManual } from "../js/redactor.js";
 import { parseCsv, stringifyCsv } from "../js/csv.js";
+import {
+  isOleFile,
+  readCfb,
+  detectOfficeEncryption,
+  parseAgileInfo,
+  agileSecretFromPassword,
+  unlockOffice,
+  WrongPasswordError,
+  UnsupportedEncryptionError,
+} from "../js/office-crypto.js";
 
 // Adapts simple per-question fakes to the detector interface: find(kind, text, variant).
 const METHOD = { person: "findPerson", address: "findAddress", account: "findAccount", id: "findId", secret: "findSecret" };
@@ -275,5 +286,246 @@ assert.strictEqual(cleanHit("Dr Priya Nair."), "Priya Nair");
   for (const [h, t] of [["Demat No", "DEMAT"], ["Account Number", "ACCOUNT"], ["Folio", "FOLIO"], ["PAN", "ID"], ["Password", "SECRET"], ["E-mail", "EMAIL"], ["Date of Birth", "DATE"]])
     assert.strictEqual(headerType(h), t, h);
   for (const h of ["Amount", "Units", "Scheme Name", "Company name", "Notes", "File name"]) assert.strictEqual(headerType(h), null, h);
+}
+
+// --- password-protected Office files (js/office-crypto.js) ---
+{
+  const hex = (s) => Uint8Array.from(Buffer.from(s, "hex"));
+  assert.strictEqual(isOleFile(new Uint8Array([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1])), true);
+  assert.strictEqual(isOleFile(new Uint8Array([0x50, 0x4b, 0x03, 0x04, 0, 0, 0, 0])), false, "a zip is not OLE");
+  assert.strictEqual(isOleFile(new Uint8Array([1, 2, 3])), false);
+
+  // Known-answer vectors for the agile key unwrap (derived from a real
+  // msoffcrypto file and cross-checked against msoffcrypto itself).
+  const info = {
+    encSalt: hex("6e05eb75f90c9418bc78f8152e693047"),
+    encHash: "SHA512",
+    encBits: 256,
+    spin: 100000,
+    verifierInput: hex("7871844f6a96f3f1760cfb955e36aca8"),
+    verifierValue: hex("0f5dc791922439bd762818bbbb37a81b5204bffb723aeaab1684e02979e83ce6f42ba92f573095860e9639e30b46cb75f491b3847372878604bb9b7db80e4fa0"),
+    encryptedKey: hex("5db3594800f70698d03cb278bfafc7973ac639042ea7b3c9c76f5fc3d86071e6"),
+  };
+  const secret = agileSecretFromPassword("correct-horse", info);
+  assert.strictEqual(Buffer.from(secret).toString("hex"), "e74e45b01f95da3caad0a93a6f7c22a736363636363636363636363636363636");
+  assert.throws(() => agileSecretFromPassword("wrong-horse", info), WrongPasswordError);
+
+  // Non-SHA512 descriptors are refused rather than mis-decrypted.
+  const sha1xml = new TextEncoder().encode(
+    "12345678<?xml version=\"1.0\"?><encryption><keyData saltValue=\"QQ==\" hashAlgorithm=\"SHA1\" keyBits=\"256\" blockSize=\"16\" />" +
+      "<keyEncryptors><keyEncryptor><encryptedKey saltValue=\"QQ==\" hashAlgorithm=\"SHA1\" keyBits=\"256\" spinCount=\"100000\" " +
+      "encryptedVerifierHashInput=\"QQ==\" encryptedVerifierHashValue=\"QQ==\" encryptedKeyValue=\"QQ==\" /></keyEncryptor></keyEncryptors></encryption>",
+  );
+  assert.throws(() => parseAgileInfo(sha1xml), UnsupportedEncryptionError);
+
+  // A hand-built minimal OLE container: one small stream stored in regular
+  // sectors (exercises the mini -> regular fallback, since 100 < 4096).
+  const ole = (() => {
+    const SEC = 512;
+    const buf = new Uint8Array(512 + 3 * SEC);
+    buf.set([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1], 0);
+    const dv = new DataView(buf.buffer);
+    const w16 = (o, v) => dv.setUint16(o, v, true);
+    const w32 = (o, v) => dv.setUint32(o, v, true);
+    w16(24, 0x3e); w16(26, 3); w16(28, 0xfffe); w16(30, 9); w16(32, 6);
+    w32(44, 1); w32(48, 1); w32(56, 4096);
+    w32(60, 0xfffffffe); w32(64, 0); w32(68, 0xfffffffe); w32(72, 0);
+    w32(76, 0);
+    for (let i = 1; i < 109; i++) w32(76 + i * 4, 0xffffffff);
+    const FATSECT = 0xfffffffd, END = 0xfffffffe, FREE = 0xffffffff;
+    [FATSECT, END, END, ...Array(125).fill(FREE)].forEach((v, i) => w32(512 + i * 4, v));
+    const entry = (idx, name, type, start, size) => {
+      const o = 512 + SEC + idx * 128;
+      for (let i = 0; i < name.length; i++) w16(o + i * 2, name.charCodeAt(i));
+      buf[o + 66] = type;
+      w32(o + 116, start);
+      dv.setBigUint64(o + 120, BigInt(size), true);
+    };
+    entry(0, "Root Entry", 5, 0xfffffffe, 0);
+    entry(1, "Fallback", 2, 2, 100);
+    for (let i = 0; i < 100; i++) buf[512 + 2 * SEC + i] = i;
+    return buf;
+  })();
+  assert.strictEqual(isOleFile(ole), true);
+  assert.deepStrictEqual(Array.from(readCfb(ole).get("fallback")), Array.from({ length: 100 }, (_, i) => i));
+  assert.strictEqual(detectOfficeEncryption(ole, "xlsx"), "open");
+
+  // Older protection versions are recognised by the EncryptionInfo header
+  // (major.minor): 2.2-4.2 standard, 3.3/4.3 extensible, anything else unknown.
+  const oleVer = (major, minor) => {
+    const b = ole.slice();
+    const dv = new DataView(b.buffer);
+    dv.setUint16(512 + 2 * 512, major, true);
+    dv.setUint16(512 + 2 * 512 + 2, minor, true);
+    const entry = (idx, name, type, start, size) => {
+      const o = 512 + 512 + idx * 128;
+      for (let i = 0; i < name.length; i++) dv.setUint16(o + i * 2, name.charCodeAt(i), true);
+      b[o + 66] = type;
+      dv.setUint32(o + 116, start, true);
+      dv.setBigUint64(o + 120, BigInt(size), true);
+    };
+    entry(0, "Root Entry", 5, 0xfffffffe, 0);
+    entry(1, "EncryptedPackage", 2, 2, 100);
+    entry(2, "EncryptionInfo", 2, 2, 100);
+    return b;
+  };
+  assert.strictEqual(detectOfficeEncryption(oleVer(4, 4), "docx"), "agile");
+  assert.strictEqual(detectOfficeEncryption(oleVer(2, 2), "docx"), "standard");
+  assert.strictEqual(detectOfficeEncryption(oleVer(3, 3), "xlsx"), "extensible");
+  assert.strictEqual(detectOfficeEncryption(oleVer(9, 9), "docx"), "unknown");
+
+  // Real fixtures (written by test/make-fixtures.mjs); skipped when absent.
+  const fx = (n) => new URL(`./fixtures/${n}`, import.meta.url).pathname;
+  if (existsSync(fx("locked.docx")) && existsSync(fx("locked-src.docx"))) {
+    for (const [enc, src, ext] of [["locked.docx", "locked-src.docx", "docx"], ["locked.xlsx", "locked-src.xlsx", "xlsx"]]) {
+      const bytes = new Uint8Array(readFileSync(fx(enc)));
+      assert.strictEqual(isOleFile(bytes), true);
+      assert.strictEqual(detectOfficeEncryption(bytes, ext), "agile");
+      const zip = unlockOffice(bytes, "correct-horse");
+      assert.deepStrictEqual(Buffer.from(zip), readFileSync(fx(src)), `${enc} decrypts to its source`);
+      assert.strictEqual(zip[0], 0x50);
+      assert.strictEqual(zip[1], 0x4b);
+      assert.throws(() => unlockOffice(bytes, "wrong-horse"), WrongPasswordError, `${enc} rejects a bad password`);
+    }
+    assert.strictEqual(detectOfficeEncryption(new Uint8Array(readFileSync(fx("sample.docx"))), "docx"), "open");
+    assert.strictEqual(detectOfficeEncryption(new Uint8Array(readFileSync(fx("sample.xlsx"))), "xlsx"), "open");
+  } else {
+    console.log("(skipped locked-fixture tests: run test/make-fixtures.mjs first)");
+  }
+}
+
+// --- redaction report: provenance end-to-end (report holds exact quotes, output unchanged) ---
+{
+  const { buildReportCsv, formatFound, provToFoundBy, REPORT_PRIVACY } = await import("../js/redactor.js");
+
+  // script: pattern spans carry source/rule and the report quotes the original.
+  {
+    const spans = findPatternSpans("PAN ABCDE1234F ok");
+    const pan = spans.find((s) => s.type === "PAN");
+    assert.strictEqual(pan.source, "script");
+    assert.strictEqual(pan.rule, "PAN");
+    const r = new Redactor();
+    const out = r.apply("PAN ABCDE1234F ok");
+    assert.strictEqual(out, "PAN [PAN] ok");
+    assert.strictEqual(r.report.length, 1);
+    assert.strictEqual(r.report[0].quote, "ABCDE1234F");
+    assert.strictEqual(r.report[0].type, "PAN");
+    assert.strictEqual(r.report[0].source, "script");
+    assert.strictEqual(r.report[0].rule, "PAN");
+    assert.deepStrictEqual(provToFoundBy(r.report[0]), { found_by: "script", detail: "PAN" });
+  }
+
+  // script: cue names record which cue found them; every occurrence reports the cue.
+  {
+    const r = new Redactor();
+    await r.learn(["Dear Mr. Rajesh Kumar Sharma, see you."]);
+    const spans = r.spans("Rajesh Kumar Sharma called. Sharma will come.");
+    assert.ok(spans.length >= 2, "cue term redacted everywhere");
+    for (const s of spans) assert.strictEqual(s.source, "cue");
+    assert.ok(String(spans[0].cue || "").length > 0, "cue label recorded");
+    const before = r.report.length;
+    const out = r.apply("Rajesh Kumar Sharma called.");
+    assert.doesNotMatch(out, /Rajesh/);
+    assert.strictEqual(r.report.length, before + 1);
+    assert.strictEqual(r.report[before].quote, "Rajesh Kumar Sharma");
+    assert.strictEqual(r.report[before].source, "cue");
+    assert.match(formatFound(r.report[before]), /script: name cue/);
+  }
+
+  // needle: fake detector records question/run/variant; quote is the document's own spelling.
+  {
+    const det = {
+      find: async (kind, text, variant) => {
+        if (kind === "person" && /zed\s+quux/i.test(text)) return "zed quux"; // sloppy case
+        if (kind === "account" && /LIC\/0034/i.test(text)) return "LIC/0034/998877";
+        return null;
+      },
+    };
+    const r = new Redactor({ detector: det });
+    await r.learn(["Zed   Quux paid LIC/0034/998877 twice."]);
+    const out = r.apply("Zed   Quux paid LIC/0034/998877.");
+    assert.strictEqual(out, "[NAME] paid [ACCOUNT].");
+    const byType = Object.fromEntries(r.report.map((e) => [e.type, e]));
+    assert.strictEqual(byType.NAME.quote, "Zed   Quux", "exact odd spacing preserved");
+    assert.strictEqual(byType.NAME.source, "needle");
+    assert.strictEqual(byType.NAME.question, "person");
+    assert.strictEqual(byType.NAME.run, 0);
+    assert.strictEqual(byType.NAME.variant, 0);
+    assert.strictEqual(byType.ACCOUNT.quote, "LIC/0034/998877");
+    assert.strictEqual(byType.ACCOUNT.source, "needle");
+    assert.strictEqual(byType.ACCOUNT.question, "account");
+    assert.match(formatFound(byType.ACCOUNT), /^needle \(account, run 0, variant 0\)/);
+    // Terms are redacted EVERYWHERE: a later occurrence still reports needle origin.
+    r.report.length = 0;
+    assert.strictEqual(r.apply("Quux owes Quux."), "[NAME] owes [NAME].");
+    assert.ok(r.report.every((e) => e.source === "needle" && e.question === "person"));
+  }
+
+  // you: manual list wins, is case/space-insensitive, and stores the entry.
+  {
+    const r = new Redactor({ manual: parseManual("Project Falcon, acme wealth pvt ltd") });
+    const out = r.apply("About project   FALCON and ACME Wealth Pvt Ltd!");
+    assert.strictEqual(out, "About [REDACTED] and [REDACTED]!");
+    assert.strictEqual(r.report.length, 2);
+    assert.strictEqual(r.report[0].quote, "project   FALCON", "exact original quote, not the entry");
+    assert.strictEqual(r.report[0].source, "you");
+    assert.strictEqual(r.report[0].entry, "Project Falcon");
+    assert.deepStrictEqual(provToFoundBy(r.report[0]), { found_by: "you", detail: "Project Falcon" });
+  }
+
+  // column: whole-column hiding records the header.
+  {
+    const r = new Redactor();
+    const label = r.hideAs("EMAIL", "a@b.co", "E-mail");
+    assert.strictEqual(label, "[EMAIL]");
+    assert.strictEqual(r.report.length, 1);
+    assert.strictEqual(r.report[0].quote, "a@b.co");
+    assert.strictEqual(r.report[0].type, "EMAIL");
+    assert.strictEqual(r.report[0].source, "column");
+    assert.strictEqual(r.report[0].header, "E-mail");
+    assert.deepStrictEqual(provToFoundBy(r.report[0]), { found_by: "script: column header", detail: "E-mail" });
+  }
+
+  // CSV: BOM, header columns, escaping, formula-injection guard, privacy line.
+  {
+    const csv = buildReportCsv([
+      { file: "a.txt", location: "line 1", page: "", type: "NAME", quote: 'Doe, "Jane"\nx', source: "cue", cue: "Dear/Hi greeting" },
+      { file: "a.txt", location: "line 2", page: "", type: "ID", quote: "=2+2", source: "script", rule: "ID" },
+      { file: "a.txt", location: "line 3", page: "", type: "CUSTOM", quote: "@evil", source: "you", entry: "evil" },
+      { file: "a.txt", location: "line 4", page: "", type: "SECRET", quote: "+123", source: "needle", question: "secret", run: 1, variant: 1 },
+      { file: "a.txt", location: "line 5", page: "", type: "PHONE", quote: "-456", source: "script", rule: "PHONE" },
+    ]);
+    assert.ok(csv.charCodeAt(0) === 0xfeff, "UTF-8 BOM for Excel");
+    const lines = csv.replace(/^﻿/, "").split("\r\n");
+    assert.ok(lines[0].startsWith("#"), "privacy warning first line");
+    assert.ok(lines[0].includes(REPORT_PRIVACY.slice(0, 20)), "privacy text present");
+    assert.strictEqual(lines[1], "file,location,page,type,quote,found_by,detail");
+    assert.ok(lines[2].includes('"Doe, ""Jane""\nx"'), "comma/quote/newline escaped");
+    assert.ok(lines[3].includes("'=2+2"), "= guarded with leading apostrophe");
+    assert.ok(lines[4].includes("'@evil"), "@ guarded");
+    assert.ok(lines[5].includes("'+123"), "+ guarded");
+    assert.ok(lines[6].includes("'-456"), "- guarded");
+    // A tab-leading cell is guarded too.
+    const tab = buildReportCsv([{ file: "f", location: "l", page: "", type: "T", quote: "\tcmd", source: "script", rule: "T" }]);
+    assert.ok(tab.includes("'\tcmd"), "tab guarded");
+  }
+
+  // Output byte-identical with reporting on: same inputs give same redacted text.
+  {
+    const det = { find: async () => null };
+    const cases = [
+      ["My PAN is ABCDE1234F, please.", "My PAN is [PAN], please."],
+      ["Pay to rahul@oksbi now", "Pay to [UPI] now"],
+      ["Account 123456789012345678 held", "Account [ACCOUNT] held"],
+      ["OTP is 482913.", "OTP is [SECRET]."],
+    ];
+    for (const [input, expected] of cases) {
+      const r = new Redactor({ detector: det });
+      await r.learn([input]);
+      assert.strictEqual(r.apply(input), expected, input);
+    }
+    const m = new Redactor({ manual: parseManual("Project Falcon, acme wealth pvt ltd, +91 98765") });
+    assert.strictEqual(m.apply("About project   FALCON: Acme Wealth Pvt Ltd called +91 98765 43210 (not Falconry)."), "About [REDACTED]: [REDACTED] called [REDACTED] 43210 (not Falconry).");
+  }
 }
 console.log("All unit tests passed.");

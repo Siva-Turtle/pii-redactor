@@ -1,5 +1,10 @@
 // Generates sample files full of FAKE personal data. Run: node test/make-fixtures.mjs
+// Encrypted fixtures ("locked.*", password "correct-horse") are produced with
+// sandbox-only Python tooling (pypdf for PDF, msoffcrypto-tool for Office),
+// which is why this step shells out to python3. Those packages are only needed
+// to *generate* fixtures, never at runtime (the page stays dependency-free).
 import { createRequire } from "node:module";
+import { execFileSync } from "node:child_process";
 import { writeFileSync } from "node:fs";
 const require = createRequire(new URL("../tools/", import.meta.url).href + "x.js");
 const JSZip = require("jszip"), XLSX = require("xlsx"), { PDFDocument, StandardFonts } = require("pdf-lib");
@@ -144,4 +149,59 @@ writeFileSync(dir + "finance.txt", [
   writeFileSync(dir + "bad.docx", Buffer.from("this is not a zip file at all"));
   writeFileSync(dir + "UPPER.TXT", "Mail me: shout@example.com");
   writeFileSync(dir + "old.doc", Buffer.from("legacy"));
+}
+
+// ---- password-protected fixtures (password for all: "correct-horse") ----
+// The Office sources are deliberately large: msoffcrypto-tool 6.0.0 mis-writes
+// the OLE container when the encrypted package is small (<=4096 bytes), so a
+// tiny fixture would come out undecryptable. Real Word/Excel files are rarely
+// that small. The python step asserts a decrypt round-trip, failing loudly.
+{
+  const big = [];
+  for (let i = 0; i < 120; i++) big.push(`Record ${i}: contact Priya Nair on +91 98765 43210 or priya.nair${i}@example.com. PAN ABCDE1234F.`);
+  const zb = new JSZip();
+  zb.file("[Content_Types].xml", `<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package/relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>`);
+  zb.file("_rels/.rels", `<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>`);
+  zb.file("word/document.xml", `<?xml version="1.0"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>${big.map((t) => `<w:p><w:r><w:t xml:space="preserve">${t}</w:t></w:r></w:p>`).join("")}</w:body></w:document>`);
+  writeFileSync(dir + "locked-src.docx", await zb.generateAsync({ type: "uint8array" }));
+
+  const rows = [["Client Name", "Email", "Phone", "Note"]];
+  for (let i = 0; i < 200; i++) rows.push([`Test Person ${i}`, `person${i}@example.com`, `98765${String(10000 + i)}`, `PAN ABCDE1234F ref ${i}`]);
+  const wbL = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wbL, XLSX.utils.aoa_to_sheet(rows), "Clients");
+  XLSX.writeFile(wbL, dir + "locked-src.xlsx");
+
+  const pyOut = execFileSync("python3", ["-"], {
+    cwd: dir,
+    input: `
+from pypdf import PdfReader, PdfWriter
+r = PdfReader("sample.pdf")
+w = PdfWriter()
+for p in r.pages:
+    w.add_page(p)
+w.encrypt("correct-horse")
+with open("locked.pdf", "wb") as f:
+    w.write(f)
+assert PdfReader("locked.pdf").is_encrypted
+print("locked.pdf ok")
+
+import io
+import msoffcrypto
+for src, out in (("locked-src.docx", "locked.docx"), ("locked-src.xlsx", "locked.xlsx")):
+    with open(src, "rb") as fin:
+        off = msoffcrypto.OfficeFile(fin)
+        off.load_key(password="correct-horse")
+        with open(out, "wb") as fout:
+            off.encrypt("correct-horse", fout)
+    with open(out, "rb") as fin:
+        back = msoffcrypto.OfficeFile(fin)
+        assert back.is_encrypted, out
+        back.load_key(password="correct-horse")
+        buf = io.BytesIO()
+        back.decrypt(buf)
+        assert buf.getvalue()[:2] == b"PK", out + " did not round-trip"
+        print(out, "ok, encrypted bytes:", len(open(out, "rb").read()))
+`,
+  });
+  console.log(String(pyOut));
 }

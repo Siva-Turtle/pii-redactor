@@ -2,12 +2,18 @@
 //
 //   const r = new Redactor({ dates: true, detector });   // detector optional (Needle)
 //   await r.learn(allTextsInTheFile, onProgress);        // AI pass: discover names/addresses
-//   r.spans(text)  -> [{start,end,type}]                 // where PII sits in `text`
+//   r.spans(text)  -> [{start,end,type,source,...}]      // where PII sits in `text`
 //   r.apply(text)  -> "…[NAME]…"                         // replaced text (also counts it)
 //
 // Layer 1 (patterns.js) finds fixed-format identifiers. Layer 2 (Needle, via
 // `detector`) discovers names, addresses and other PII; each one found is then redacted
 // EVERYWHERE it occurs in the file, not only in the chunk that revealed it.
+//
+// Provenance: every span carries where it was found so the per-file
+// `redactor.report` can list the exact original quote, its type and who found
+// it. Sources: "script" (regex rule), "cue" (deterministic name cue),
+// "needle" (Cactus Needle model), "you" (user's manual list),
+// "column" (whole spreadsheet/CSV column hidden by its header).
 
 import { NOT_A_SECRET, applySpans, findPatternSpans, labelFor } from "./patterns.js";
 
@@ -19,7 +25,7 @@ const MAX_RUNS = 12; // hard cap on Needle runs per chunk
 const EMPTY_RUNS_TO_STOP = 2; // stop after this many consecutive runs that find nothing new
 // Words that merely open a sentence; a capital letter on them says nothing.
 const STARTERS = new Set(
-  ("the this that these those there then they their them please kindly our your you his her with from for and but however also any all can could will would should what when where how why which who are was were has have had not its into over under after before about as at by if in is it of on or so to we").split(" "),
+  ("the this that these those there then they their them please kindly our your you his her with from for and but however also any all can could will would should what when where how why which who are was were has have had not its into over under before after about as at by if in is it of on or so to we").split(" "),
 );
 const TITLES = /^(?:mr|mrs|ms|miss|dr|shri|smt|sri|prof|mx)$/i;
 const CORPORATE = /\b(?:pvt|ltd|limited|bank|inc|llc|llp|corp|wealth|capital|finance|fund|trust|services|technologies|solutions|group|company|co|insurance|securities|partners)\b/i;
@@ -29,7 +35,7 @@ const ADDRESS_HINT =
 // Capitalised words the model sometimes reports on their own; never a name.
 const NOT_A_NAME = new Set(
   ("dear hi hello hey regards thanks thank sincerely yours please registered client customer account address " +
-    "contact mobile phone email name sir madam team office branch bank date amount total note notes subject " +
+    "contact mobile phone email name sir madam team office branch bank date amount total note notes " +
     "dob pan aadhaar aadhar ssn gst ifsc upi monday tuesday wednesday thursday friday saturday sunday january february march april may june july august " +
     "september october november december india indian mumbai delhi bengaluru bangalore chennai kolkata pune hyderabad").split(" "),
 );
@@ -47,6 +53,7 @@ export function cleanHit(hit) {
 
 const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 const wsRe = (s) => escapeRe(s).replace(/\s+/g, "\\s+");
+const normKey = (s) => s.replace(/\s+/g, " ").trim().toLowerCase();
 
 /** Split text into model-sized chunks on sentence/line breaks. */
 export function chunkText(text) {
@@ -93,12 +100,61 @@ export function buildManual(items) {
   const list = [...new Set(items.map((x) => x.replace(/\s+/g, " ").trim()).filter((x) => x.length >= 2))].sort((a, b) => b.length - a.length);
   if (!list.length) return null;
   const body = list.map((x) => `${/^[\p{L}\p{N}]/u.test(x) ? "(?<![\\p{L}\\p{N}])" : ""}${wsRe(x)}${/[\p{L}\p{N}]$/u.test(x) ? "(?![\\p{L}\\p{N}])" : ""}`).join("|");
-  return new RegExp(body, "giu");
+  const re = new RegExp(body, "giu");
+  // WHY attached: spans() maps each match back to the entry the user typed.
+  re.entries = list;
+  return re;
 }
 
 /** Split what the user typed into items: commas and line breaks both separate. */
 export function parseManual(text) {
   return String(text || "").split(/[,\n]/).map((x) => x.trim()).filter(Boolean);
+}
+
+// ------------------------------------------------------------------ report
+export const REPORT_PRIVACY =
+  "WARNING: This report contains the ORIGINAL sensitive text that was hidden. Keep it private and never send it along with the redacted file.";
+export const REPORT_COLUMNS = ["file", "location", "page", "type", "quote", "found_by", "detail"];
+
+/** found_by/detail pair for a report entry or span carrying provenance. */
+export function provToFoundBy(s) {
+  const src = s?.source;
+  if (src === "cue") return { found_by: "script: name cue", detail: s.cue || "" };
+  if (src === "column") return { found_by: "script: column header", detail: s.header || "" };
+  if (src === "you") return { found_by: "you", detail: s.entry || "" };
+  if (src === "needle") {
+    const q = s.question === "pii" ? "find_pii" : (s.question || "");
+    return { found_by: "needle", detail: `${q}, run ${s.run ?? ""}, variant ${s.variant ?? ""}`.trim() };
+  }
+  return { found_by: "script", detail: s?.rule || s?.type || "" };
+}
+
+/** Human-readable "found by" for the on-page table, e.g. `script (PAN)`. */
+export function formatFound(s) {
+  const { found_by, detail } = provToFoundBy(s);
+  return detail ? `${found_by} (${detail})` : found_by;
+}
+
+const INJECTION_LEAD = /^[=+\-@\t\r]/;
+function csvCell(v) {
+  let s = String(v ?? "");
+  // Guard against spreadsheet formula injection: a leading ' neutralises =, +, -, @.
+  if (INJECTION_LEAD.test(s)) s = `'${s}`;
+  return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+}
+
+/** Build the downloadable report CSV (UTF-8 with BOM for Excel). Rows carry file/location/page/type/quote/found_by/detail. */
+export function buildReportCsv(rows) {
+  const lines = [`# ${REPORT_PRIVACY}`, REPORT_COLUMNS.map(csvCell).join(",")];
+  for (const r of rows) {
+    const { found_by, detail } = provToFoundBy(r);
+    lines.push(
+      [r.file ?? "", r.location ?? "", r.page ?? "", r.type ?? "", r.quote ?? "", found_by, r.detail ?? detail]
+        .map(csvCell)
+        .join(","),
+    );
+  }
+  return `﻿${lines.join("\r\n")}\r\n`;
 }
 
 export class Redactor {
@@ -113,6 +169,9 @@ export class Redactor {
     this.counts = {};
     this.seen = new Set();
     this._compiled = null;
+    this.report = []; // per-file redaction report entries (in-memory only)
+    this.termProv = new Map(); // norm term -> {source,...}, first discovery wins
+    this.tokenProv = new Map(); // exact token -> {source,...}
   }
 
   /** Reset the per-file tally (terms learned in earlier files are kept out too). */
@@ -122,6 +181,9 @@ export class Redactor {
     this.tokens = new Set();
     this.seen = new Set();
     this._compiled = null;
+    this.report = [];
+    this.termProv = new Map();
+    this.tokenProv = new Map();
   }
 
   /**
@@ -161,20 +223,20 @@ export class Redactor {
     const CAP = "\\p{Lu}\\p{Ll}+";
     const NAME = `(${CAP}(?:[ \\t]+${CAP}){0,3})`;
     const cues = [
-      `\\b(?:Mr|Mrs|Ms|Miss|Dr|Shri|Smt|Sri|Prof)\\.?[ \\t]+${NAME}`,
-      `\\b(?:Dear|Hi|Hello|Hey)[ \\t]+(?:(?:Mr|Mrs|Ms|Miss|Dr|Shri|Smt|Sri|Prof)\\.?[ \\t]+)?${NAME}`,
-      `\\b(?:Regards|Thanks|Thank you|Sincerely|Best|Cheers|Yours (?:truly|sincerely|faithfully))[,!.]?[ \\t]*\\r?\\n?[ \\t]*${NAME}`,
-      `\\b(?:Name|Client|Customer|Applicant|Nominee|Beneficiary|Holder|Guardian|Spouse|Wife|Husband|Father|Mother|Son|Daughter|Brother|Sister)(?:[ \\t]+name)?[ \\t]*[:\\-–][ \\t]*${NAME}`,
-      `\\b(?:spouse|wife|husband|father|mother|son|daughter|brother|sister|nominee)[ \\t]+${NAME}`,
+      { cue: "Mr./Ms./Dr. title", src: `\\b(?:Mr|Mrs|Ms|Miss|Dr|Shri|Smt|Sri|Prof)\\.?[ \\t]+${NAME}` },
+      { cue: "Dear/Hi greeting", src: `\\b(?:Dear|Hi|Hello|Hey)[ \\t]+(?:(?:Mr|Mrs|Ms|Miss|Dr|Shri|Smt|Sri|Prof)\\.?[ \\t]+)?${NAME}` },
+      { cue: "sign-off (Regards…)", src: `\\b(?:Regards|Thanks|Thank you|Sincerely|Best|Cheers|Yours (?:truly|sincerely|faithfully))[,!.]?[ \\t]*\\r?\\n?[ \\t]*${NAME}` },
+      { cue: "Name:/Client: label", src: `\\b(?:Name|Client|Customer|Applicant|Nominee|Beneficiary|Holder|Guardian|Spouse|Wife|Husband|Father|Mother|Son|Daughter|Brother|Sister)(?:[ \\t]+name)?[ \\t]*[:\\-–][ \\t]*${NAME}` },
+      { cue: "relation (spouse…)", src: `\\b(?:spouse|wife|husband|father|mother|son|daughter|brother|sister|nominee)[ \\t]+${NAME}` },
     ];
-    for (const src of cues) {
+    for (const { cue, src } of cues) {
       for (const m of text.matchAll(new RegExp(src, "gu"))) {
         const words = [];
         for (const w of m[1].split(/\s+/)) {
           if (NOT_A_NAME.has(w.toLowerCase()) || TITLES.test(w)) break;
           words.push(w);
         }
-        if (words.length) this._addTerm(words.join(" "), "NAME");
+        if (words.length) this._addTerm(words.join(" "), "NAME", { source: "cue", cue });
       }
     }
   }
@@ -190,15 +252,18 @@ export class Redactor {
     let working = chunk;
     let empty = 0;
     for (let run = 0; run < MAX_RUNS && empty < this.emptyRunsToStop; run++) {
-      const hits = await this._askAll(working, run % 2);
+      const variant = run % 2;
+      const hits = await this._askAll(working, variant);
       // Validate every answer against the SAME text (a longer address must not
       // lose to a name found inside it), then blank them all out together.
       const base = working;
       let added = 0;
-      for (const { raw, kind } of hits) {
+      for (const { raw, kind, question } of hits) {
         const found = this._accept(raw, kind, base);
         if (!found) continue;
-        this._addTerm(found.term, found.kind);
+        // WHY first-wins in _addTerm: every later occurrence in the file
+        // reports the run/phrasing that first surfaced the term.
+        this._addTerm(found.term, found.kind, { source: "needle", question, run, variant });
         working = working.replace(new RegExp(wsRe(found.term), "gi"), "_");
         added++;
       }
@@ -229,7 +294,7 @@ export class Redactor {
         .map(async (q) => {
           try {
             const raw = await d.find(q, text, variant);
-            if (raw) out.push({ raw, kind: KIND[q] });
+            if (raw) out.push({ raw, kind: KIND[q], question: q });
           } catch {
             /* one failed question must not lose the others */
           }
@@ -281,20 +346,30 @@ export class Redactor {
     return { term: m[0], kind };
   }
 
-  _addTerm(raw, kind) {
+  _addTerm(raw, kind, prov = null) {
     const term = raw.replace(/\s+/g, " ").trim();
     if (term.length < 2 || term.length > 140) return;
+    const key = normKey(term);
     if (kind === "NAME" && !/\d/.test(term)) {
+      if (prov && !this.termProv.has(key)) this.termProv.set(key, prov);
+      else if (!prov && !this.termProv.has(key)) this.termProv.set(key, { source: "cue", cue: "name cue" });
       this.terms.NAME.add(term);
       const words = term.split(" ");
       const tokenizable = words.length <= 3 && !term.includes(",") && !CORPORATE.test(term);
       if (tokenizable) {
         for (const w of words) {
-          if (/^\p{Lu}\p{L}{3,}$/u.test(w) && !TITLES.test(w)) this.tokens.add(w);
+          if (/^\p{Lu}\p{L}{3,}$/u.test(w) && !TITLES.test(w)) {
+            this.tokens.add(w);
+            if (prov && !this.tokenProv.has(w)) this.tokenProv.set(w, prov);
+            else if (!this.tokenProv.has(w)) this.tokenProv.set(w, this.termProv.get(key) || { source: "cue", cue: "name cue" });
+          }
         }
       }
     } else {
-      this.terms[kind === "NAME" ? "ADDRESS" : kind].add(term);
+      const bucket = kind === "NAME" ? "ADDRESS" : kind;
+      if (prov && !this.termProv.has(key)) this.termProv.set(key, prov);
+      else if (!prov && !this.termProv.has(key)) this.termProv.set(key, { source: "needle", question: bucket, run: 0, variant: 0 });
+      this.terms[bucket].add(term);
     }
     this._compiled = null;
   }
@@ -316,11 +391,33 @@ export class Redactor {
     ].filter((c) => c.re);
   }
 
+  _provForLearned(text) {
+    const exact = this.tokenProv.get(text);
+    if (exact) return exact;
+    const p = this.termProv.get(normKey(text));
+    if (p) return p;
+    return { source: "needle", question: "find_pii", run: 0, variant: 0 };
+  }
+
+  _manualEntryFor(match) {
+    const list = this.manual?.entries || [];
+    const key = normKey(match);
+    for (const e of list) if (normKey(e) === key) return e;
+    // Fallback: case-insensitive containment (e.g. entry without boundaries).
+    const low = match.toLowerCase();
+    for (const e of list) if (low === e.toLowerCase()) return e;
+    return match;
+  }
+
   spans(text) {
     if (!text) return [];
     // The user's own list wins over everything else.
     const manual = [];
-    if (this.manual) for (const m of text.matchAll(this.manual)) manual.push({ start: m.index, end: m.index + m[0].length, type: "CUSTOM" });
+    if (this.manual) {
+      for (const m of text.matchAll(this.manual)) {
+        manual.push({ start: m.index, end: m.index + m[0].length, type: "CUSTOM", source: "you", entry: this._manualEntryFor(m[0]) });
+      }
+    }
     const spans = findPatternSpans(text, { dates: this.dates }).filter(
       (sp) => !manual.some((m) => sp.start < m.end && sp.end > m.start),
     );
@@ -342,7 +439,7 @@ export class Redactor {
           }
           if (!free) continue;
           taken.fill(1, start, end);
-          spans.push({ start, end, type });
+          spans.push({ start, end, type, ...this._provForLearned(m[0]) });
         }
       }
       spans.sort((a, b) => a.start - b.start);
@@ -350,8 +447,27 @@ export class Redactor {
     return spans;
   }
 
-  count(spans) {
-    for (const s of spans) this.counts[s.type] = (this.counts[s.type] || 0) + 1;
+  _record(spans, text) {
+    for (const s of spans) {
+      this.counts[s.type] = (this.counts[s.type] || 0) + 1;
+      // WHY slice from the input: the report must hold the exact original
+      // quote, character-for-character (odd spacing/case included).
+      const quote = text != null && s.start != null ? text.slice(s.start, s.end) : (s.quote ?? "");
+      this.report.push({
+        quote, type: s.type, source: s.source, rule: s.rule, cue: s.cue,
+        question: s.question, run: s.run, variant: s.variant,
+        entry: s.entry, header: s.header, start: s.start ?? null, end: s.end ?? null,
+        location: s.location ?? "", page: s.page ?? "",
+      });
+    }
+  }
+
+  count(spans, text = null) {
+    if (text == null) {
+      for (const s of spans) this.counts[s.type] = (this.counts[s.type] || 0) + 1;
+      return;
+    }
+    this._record(spans, text);
   }
 
   /** Redact `text`, tally what was hidden, return the new text. */
@@ -359,14 +475,21 @@ export class Redactor {
     if (!text) return text;
     const spans = this.spans(text);
     if (!spans.length) return text;
-    this.count(spans);
+    // WHY count+record here (not in spans): spans() is also used for probing
+    // (PDF render measurement, link targets), which must not double-report.
+    this._record(spans, text);
     return applySpans(text, spans);
   }
 
   /** Hide a whole value (used for header-detected columns). */
-  hideAs(type, text) {
+  hideAs(type, text, header = null) {
     if (!text) return text;
     this.counts[type] = (this.counts[type] || 0) + 1;
+    this.report.push({
+      quote: text, type, source: "column", header,
+      rule: null, cue: null, question: null, run: null, variant: null,
+      entry: null, start: null, end: null, location: "", page: "",
+    });
     return labelFor(type);
   }
 

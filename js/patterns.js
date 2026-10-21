@@ -97,7 +97,7 @@ export function labelFor(type) {
 /**
  * @param {string} text
  * @param {{ dates?: boolean }} [opts]
- * @returns {{start:number,end:number,type:string}[]} non-overlapping, sorted
+ * @returns {{start:number,end:number,type:string,source:string,rule:string}[]} non-overlapping, sorted
  */
 export function findPatternSpans(text, { dates = true } = {}) {
   if (!text) return [];
@@ -120,7 +120,9 @@ export function findPatternSpans(text, { dates = true } = {}) {
       }
       if (!free) continue;
       taken.fill(1, start, end);
-      if (!silent) spans.push({ start, end, type: rule.type });
+      // WHY provenance on every span: the redaction report must say which
+      // layer hid each quote. Pattern hits are always source "script".
+      if (!silent) spans.push({ start, end, type: rule.type, source: "script", rule: rule.type });
     }
   }
   return spans.sort((a, b) => a.start - b.start);

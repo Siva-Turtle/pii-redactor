@@ -8,5 +8,7 @@
 | [pdf-lib](https://github.com/Hopding/pdf-lib) | writes the redacted PDF | MIT |
 | [JSZip](https://github.com/Stuk/jszip) | opens/saves .docx and builds the ZIP download | MIT (dual-licensed MIT/GPLv3) |
 | [SheetJS CE](https://github.com/SheetJS/sheetjs) | reads/writes .xlsx | Apache-2.0 |
+| [@noble/hashes](https://github.com/paulmillr/noble-hashes) (SHA-512 only, bundled as `vendor/noble-crypto.min.mjs`) | password-to-key derivation for protected Office files | MIT |
+| [@noble/ciphers](https://github.com/paulmillr/noble-ciphers) (AES-CBC only, same bundle) | decrypts protected Office files | MIT |
 
 The regular-expression layer in `js/patterns.js` is ported from the Turtle CRM's `backend/utils/piiMasking.js`.
