@@ -11,6 +11,8 @@ cp $N/cactus-needle/dist/browser/worker.js $V/needle/worker.js
 cp $N/cactus-needle/vendor/needle.wasm $V/needle/needle.wasm
 cp $N/cactus-needle/vendor/LICENSE $V/needle/LICENSE-needle
 cp $N/pdfjs-dist/build/pdf.min.mjs $N/pdfjs-dist/build/pdf.worker.min.mjs $V/pdfjs/
+cp $N/tesseract.js/dist/tesseract.min.js $N/tesseract.js/dist/worker.min.js $V/tesseract/
+cp $N/tesseract.js-core/tesseract-core*.js $N/tesseract.js-core/tesseract-core*.wasm $V/tesseract/
 cp $N/jszip/dist/jszip.min.js $N/xlsx/dist/xlsx.full.min.js $N/pdf-lib/dist/pdf-lib.min.js $V/
 # Self-hosted UI fonts (OFL): Fraunces 500 (headings) + Inter 400/500/600
 # (body), latin subset woff2 only (~90 KB total, no network at runtime).
@@ -50,4 +52,12 @@ done
 # The 183 MB onnx weights are NOT committed (GitHub's 100 MB file limit);
 # fetch-model.sh downloads them with a SHA-256 check (skips when present).
 bash fetch-model.sh
+# English OCR data (tessdata_fast, Apache-2.0). Pinned checksum: the file
+# lives on a moving branch, so a mismatch fails loudly for a maintainer to
+# re-pin instead of silently vendoring new bytes.
+TESSDATA_SHA=7d4322bd2a7749724879683fc3912cb542f19906c83bcc1a52132556427170b2
+if [ ! -f $V/tesseract/eng.traineddata ] || ! echo "$TESSDATA_SHA  $V/tesseract/eng.traineddata" | sha256sum -c -; then
+  curl -fL -o $V/tesseract/eng.traineddata "https://raw.githubusercontent.com/tesseract-ocr/tessdata_fast/main/eng.traineddata"
+  echo "$TESSDATA_SHA  $V/tesseract/eng.traineddata" | sha256sum -c -
+fi
 echo "vendor/ refreshed."

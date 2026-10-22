@@ -1,7 +1,7 @@
 const { chromium } = require(process.env.PW || "playwright");
 const path = require("path");
 (async () => {
-  const b = await chromium.launch({ executablePath: "/opt/pw-browsers/chromium" });
+  const b = await chromium.launch(process.env.PW_CHROMIUM ? { executablePath: process.env.PW_CHROMIUM } : {});
   const p = await b.newPage();
   p.on("pageerror", (e) => console.log("pageerror:", e.message));
   await p.goto("http://localhost:8731/");

@@ -1,8 +1,8 @@
 const { chromium } = require(process.env.PW || "playwright");
 const path = require("path"), fs = require("fs");
-const JSZip = require("/home/user/pii-redactor/tools/node_modules/jszip");
+const JSZip = require(path.join(__dirname, "..", "tools", "node_modules", "jszip"));
 (async () => {
-  const b = await chromium.launch({ executablePath: "/opt/pw-browsers/chromium" });
+  const b = await chromium.launch(process.env.PW_CHROMIUM ? { executablePath: process.env.PW_CHROMIUM } : {});
   // 1. ZIP of files with the same name (deduped entries, reports excluded)
   const p = await b.newPage({ acceptDownloads: true });
   p.on("pageerror", (e) => console.log("pageerror:", e.message));
@@ -20,7 +20,7 @@ const JSZip = require("/home/user/pii-redactor/tools/node_modules/jszip");
   // 2. file:// shows the friendly banner and does not throw
   const q = await b.newPage();
   const errs = []; q.on("pageerror", (e) => errs.push(e.message));
-  await q.goto("file:///home/user/pii-redactor/index.html");
+  await q.goto(`file://${path.join(__dirname, "..", "index.html")}`);
   await q.waitForTimeout(800);
   console.log("file:// banner:", (await q.textContent("#banner")).slice(0, 90), "| page errors:", JSON.stringify(errs));
   await b.close();

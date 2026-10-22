@@ -3,7 +3,7 @@ const { chromium } = require(process.env.PW || "playwright");
 const fs = require("fs"), path = require("path");
 (async () => {
   const expected = JSON.parse(fs.readFileSync(path.join(__dirname, "fixtures/mixed.expected.json")));
-  const b = await chromium.launch({ executablePath: "/opt/pw-browsers/chromium" });
+  const b = await chromium.launch(process.env.PW_CHROMIUM ? { executablePath: process.env.PW_CHROMIUM } : {});
   const p = await b.newPage();
   await p.goto("http://localhost:8731/");
   const res = await p.evaluate(async ({ f, expected }) => {

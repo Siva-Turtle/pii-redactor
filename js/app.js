@@ -252,7 +252,7 @@ async function processOnce() {
   for (const row of pending) {
     if (!SUPPORTED.includes(extOf(row.file.name))) {
       row.status = "error";
-      row.failMessage = "Please use PDF, Word (.docx), Excel, CSV, text or Markdown files.";
+        row.failMessage = "Please use PDF, Word (.docx), Excel, CSV, text, Markdown or image (JPG, PNG, WebP) files.";
       renderRow(row);
       continue;
     }

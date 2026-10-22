@@ -9,6 +9,9 @@
 | [onnxruntime-web](https://github.com/microsoft/onnxruntime) 1.19.2 (`vendor/gliner/ort-wasm-simd-threaded.mjs/.wasm`) | runs the GLiNER model (single-thread wasm) | MIT |
 | [deberta-v3-small](https://huggingface.co/microsoft/deberta-v3-small) tokenizer + model config (via the GLiNER model files above) | subword tokenisation for GLiNER | MIT |
 | [pdf.js](https://github.com/mozilla/pdf.js) | reads PDF text and draws pages | Apache-2.0 |
+| [tesseract.js](https://github.com/naptha/tesseract.js) 5.1.1 (`vendor/tesseract/tesseract.min.js`, `worker.min.js`) | OCR engine: reads text inside pictures | Apache-2.0 |
+| [tesseract.js-core](https://github.com/naptha/tesseract.js-core) 5.1.1 (`vendor/tesseract/tesseract-core-*.wasm` + loaders) | OCR engine's WebAssembly core | Apache-2.0 |
+| [tessdata_fast](https://github.com/tesseract-ocr/tessdata_fast) English data (`vendor/tesseract/eng.traineddata`) | English letter shapes for the OCR engine | Apache-2.0 |
 | [pdf-lib](https://github.com/Hopding/pdf-lib) | writes the redacted PDF | MIT |
 | [JSZip](https://github.com/Stuk/jszip) | opens/saves .docx and builds the ZIP download | MIT (dual-licensed MIT/GPLv3) |
 | [SheetJS CE](https://github.com/SheetJS/sheetjs) | reads/writes .xlsx | Apache-2.0 |

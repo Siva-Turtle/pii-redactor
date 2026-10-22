@@ -12,6 +12,17 @@ Launch an implementation session like this:
 opencode run -m opencode-go/muse-spark-1.3-contributor --dir /home/user/pii-redactor "<brief>"
 ```
 
+Never let an opencode run stall unnoticed:
+
+- Launch it in the background with stdin closed (`... "<brief>" < /dev/null`);
+  without that it can sit at init waiting for input.
+- While it runs, always keep a background `sleep 300` task going so Claude is
+  called back every 5 minutes. On each wake, check opencode's own log
+  (`~/.local/share/opencode/log/opencode.log`: latest `step=` and timestamp)
+  and the working tree, then re-arm the sleep. If there is no new step for
+  ~7 minutes, kill it and relaunch with a corrected brief.
+- Briefs forbid filesystem-wide searches (`find /`, `find C:`): one froze a run.
+
 Notes for briefs in this repo:
 
 - Static, browser-only tool. Work ONLY inside `/home/user/pii-redactor`;

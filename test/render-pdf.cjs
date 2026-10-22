@@ -1,6 +1,6 @@
 const { chromium } = require(process.env.PW || "playwright");
 (async () => {
-  const b = await chromium.launch({ executablePath: "/opt/pw-browsers/chromium" });
+  const b = await chromium.launch(process.env.PW_CHROMIUM ? { executablePath: process.env.PW_CHROMIUM } : {});
   const p = await b.newPage({ viewport: { width: 820, height: 560 } });
   await p.goto("http://localhost:8765/");
   const res = await p.evaluate(async (f) => {
@@ -16,6 +16,6 @@ const { chromium } = require(process.env.PW || "playwright");
     return { pages: doc.numPages, textItems: text };
   }, "/test/out/sample.redacted.pdf");
   console.log(JSON.stringify(res));
-  await p.screenshot({ path: "/home/user/pii-redactor/test/out/pdf.png" });
+  await p.screenshot({ path: require("path").join(__dirname, "out", "pdf.png") });
   await b.close();
 })();

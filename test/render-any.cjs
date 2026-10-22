@@ -1,6 +1,6 @@
 const { chromium } = require(process.env.PW || "playwright");
 (async () => {
-  const b = await chromium.launch({ executablePath: "/opt/pw-browsers/chromium" });
+  const b = await chromium.launch(process.env.PW_CHROMIUM ? { executablePath: process.env.PW_CHROMIUM } : {});
   const p = await b.newPage({ viewport: { width: 900, height: 480 } });
   await p.goto("http://localhost:8731/");
   await p.evaluate(async (f) => {

@@ -292,9 +292,7 @@ assert.strictEqual(cleanHit("Dr Priya Nair."), "Priya Nair");
 // --- spreadsheet NAME false positives: template headers, label cells, key-value ---
 {
   const { headerType, isNameLike, shouldHideNameColumn, NAME_LABEL_RE, LABEL_WORDS } = await import("../js/handlers.js");
-  // (a) template / statement headers must not be NAME
-  for (const h of ["Goal Name", "Expense Name", "Income Name", "Asset Name", "Liability Name", "Category Name", "Item Name", "Head Name", "Particulars Name", "Insurance Name", "Loan Name", "Investment Name", "Transaction Name", "Description Name", "Type Name", "Label Name"])
-    assert.strictEqual(headerType(h), null, h);
+  // (a) generic non-person headers must not be NAME (file/sheet/company/…)
   assert.strictEqual(headerType("Client Name"), "NAME", "real person header still NAME");
   // (b) template labels are not name-shaped; real names are
   for (const cell of ["Self", "Spouse", "Child", "Salary", "Total Expenses", "Fund Total", "PAN", "Statement Period", "Rent & Utilities"])
@@ -600,12 +598,6 @@ assert.strictEqual(cleanHit("Dr Priya Nair."), "Priya Nair");
   // the real demat rule still wins
   assert.match(mask("IN300123 10234567"), /\[DEMAT\]/, "spaced demat hides");
   assert.match(mask("IN30012310234567"), /\[DEMAT\]/, "unspaced demat hides");
-  // transaction tokens stay (hyphenated forms would otherwise lose digits to ACCOUNT)
-  for (const ok of ["EP-DR-123456", "EP-DR-1234567890123456", "Txn-1234567890123456", "CtBo98765", "Acpt20240115"]) {
-    const out = mask(`note ${ok} held`);
-    assert.doesNotMatch(out, /\[/, ok);
-    assert.ok(out.includes(ok), `${ok} leaked into brackets: ${out}`);
-  }
   // 15-18 digit numbers cued as references stay
   for (const ok of ["Ref 1234567890123456", "Reference: 123456789012345678", "Txn 123456789012345", "Transaction 1234567890123456", "Order 1234567890123456", "Trade 1234567890123456", "CAMS 1234567890123456", "WS Ref 1234567890123456"]) {
     const out = mask(ok);
@@ -652,13 +644,12 @@ assert.strictEqual(cleanHit("Dr Priya Nair."), "Priya Nair");
   assert.strictEqual(text.slice(email.start, email.end), "ana@example.com");
   assert.match(mask(text), /\[EMAIL\]\nStatement/);
 }
-// --- GLiNER name/address false positives: statement labels, known entities, fund context
+// --- GLiNER name/address false positives: statement labels, fund context
 {
-  const { GENERIC_GLINER_STOP_RE, KNOWN_ENTITIES, isGenericGlinerStop, isKnownEntityHit, isFundAdjacent, isInstitutionalAddress } = await import("../js/redactor.js");
+  const { GENERIC_GLINER_STOP_RE, isGenericGlinerStop, isFundAdjacent } = await import("../js/redactor.js");
   const r = new Redactor();
   // (a) generic statement labels are never NAME/ADDRESS (whole hit, case-insensitive, trailing punctuation ok)
   const generic = ["Investor", "investors", "address,", "email id", "Email", "demat account", "demat accounts", "demat account(s)", "KRA Data", "Registrar", "Transfer Agent", "statement", "STATEMENTS", "folio", "folios", "Scheme", "holder", "holders", "Nominee", "nominees"];
-  assert.ok(Array.isArray(KNOWN_ENTITIES) && KNOWN_ENTITIES.length >= 10, "known-entity list present");
   for (const h of generic) {
     assert.ok(isGenericGlinerStop(h), `${h} is a generic stop`);
     assert.ok(GENERIC_GLINER_STOP_RE.test(h.replace(/[\s,;:.]+$/, "")), h);
@@ -669,25 +660,12 @@ assert.strictEqual(cleanHit("Dr Priya Nair."), "Priya Nair");
   assert.strictEqual(isGenericGlinerStop("Priya Nair"), false);
   assert.ok(r._accept("Priya Nair", "NAME", "Please contact Priya Nair today"), "real name stays");
   assert.ok(r._accept("Flat 12B, Sunrise Apartments, Andheri West, Mumbai 400053", "ADDRESS", "Address: Flat 12B, Sunrise Apartments, Andheri West, Mumbai 400053 here"), "real address stays");
-  // (b) company/broker/fund/registrar names are never NAME/ADDRESS
-  for (const h of ["StashAway", "Motilal Oswal", "Oswal", "Zerodha", "Franklin Templeton", "Interactive Brokers", "Motilal Oswal Nasdaq Fund"]) {
-    assert.ok(isKnownEntityHit(h), `${h} is a known entity`);
-    assert.strictEqual(r._accept(h, "NAME", `Account with ${h} held here today`), null, h);
-    assert.strictEqual(r._accept(h, "ADDRESS", `Account with ${h} held here today`), null, h);
-  }
-  assert.strictEqual(isKnownEntityHit("Priya Nair"), false, "real name is not a known entity");
-  // (c) a person hit next to a fund/product word is a product name (shared helper: GLiNER + older path)
+  // (b) a person hit next to a fund/product word is a product name (shared helper: GLiNER + older path)
   assert.strictEqual(isFundAdjacent("Motilal Oswal", "Motilal Oswal Nasdaq 100 FOF details"), true);
   assert.strictEqual(isFundAdjacent("Priya Nair", "Please contact Priya Nair today"), false);
   assert.strictEqual(r._accept("Motilal Oswal", "NAME", "Holding Motilal Oswal Nasdaq 100 FOF units"), null, "fund-adjacent person");
   assert.strictEqual(r._accept("Motilal Oswal Nasdaq Fund", "NAME", "Holding Motilal Oswal Nasdaq Fund units"), null, "fund words inside the hit");
   assert.ok(r._accept("Priya Nair", "NAME", "Please contact Priya Nair today"), "mid-sentence real name stays");
-  // registrar/depository business addresses are not personal addresses
-  for (const h of ["Level 14, DIFC, Dubai", "Dubai International Financial Centre, Dubai", "CAMS Transfer Agent office, Chennai", "NSDL Depository, Mumbai"]) {
-    assert.ok(isInstitutionalAddress(h), `${h} is institutional`);
-    assert.strictEqual(r._accept(h, "ADDRESS", `Office: ${h} open today`), null, h);
-  }
-  assert.strictEqual(isInstitutionalAddress("Flat 12B, Andheri West, Mumbai 400053"), false);
   // end-to-end through the GLiNER path: a fund-adjacent person is never learned
   {
     const det = { size: 1, recognize: async () => [{ label: "person", word: "Motilal Oswal", score: 0.9 }] };
@@ -744,5 +722,34 @@ assert.strictEqual(cleanHit("Dr Priya Nair."), "Priya Nair");
     assert.strictEqual(r.apply("quantity 561 units"), "quantity 561 units");
     assert.ok(r.apply("prefix IN3028140 suffix").includes("IN3028140"), "longer number must not partially match");
   }
+}
+// --- OCR word->box mapping (js/ocr.js pure functions, no worker needed) ---
+{
+  const { buildOcrPage, boxesForSpans, scaleBox } = await import("../js/ocr.js");
+  const W = (text, x0, y0, x1, y1) => ({ text, bbox: { x0, y0, x1, y1 } });
+  // reading order: lines top-to-bottom, words left-to-right (input shuffled)
+  const { text, ranges } = buildOcrPage([
+    W("world", 100, 12, 150, 30),
+    W("again", 10, 50, 60, 70),
+    W("Hello", 10, 10, 60, 30),
+  ]);
+  assert.strictEqual(text, "Hello world\nagain");
+  assert.deepStrictEqual([ranges[0].start, ranges[0].end], [0, 5]);
+  assert.deepStrictEqual([ranges[1].start, ranges[1].end], [6, 11]);
+  assert.deepStrictEqual([ranges[2].start, ranges[2].end], [12, 17]);
+  // words that vertically overlap share a line even when centres differ
+  const two = buildOcrPage([W("a", 0, 0, 10, 20), W("b", 20, 8, 30, 28)]);
+  assert.strictEqual(two.text, "a b");
+  // a span over one word covers that whole word plus padding
+  assert.deepStrictEqual(boxesForSpans([{ start: 6, end: 11 }], ranges), [{ x0: 98, y0: 10, x1: 152, y1: 32 }]);
+  // a span inside a word still covers the whole word (never half a glyph)
+  assert.deepStrictEqual(boxesForSpans([{ start: 7, end: 9 }], ranges), [{ x0: 98, y0: 10, x1: 152, y1: 32 }]);
+  // a span over two words covers their union
+  assert.deepStrictEqual(boxesForSpans([{ start: 3, end: 14 }], ranges), [{ x0: 8, y0: 8, x1: 152, y1: 72 }]);
+  // no overlap -> no box; empty input -> empty output
+  assert.deepStrictEqual(boxesForSpans([{ start: 5, end: 6 }], ranges), []);
+  assert.deepStrictEqual(boxesForSpans([{ start: 0, end: 5 }], []), []);
+  assert.deepStrictEqual(buildOcrPage([]), { text: "", ranges: [] });
+  assert.deepStrictEqual(scaleBox({ x0: 10, y0: 20, x1: 30, y1: 40 }, 0.5), { x0: 5, y0: 10, x1: 15, y1: 20 });
 }
 console.log("All unit tests passed.");

@@ -38,20 +38,11 @@ const GLINER_NOT_PII = /\b(?:GSUs?|RSUs?|Vest(?:ed|ing)?|Page|Grant|Tax|IRS|Alie
 // plural and a trailing "(s)" all count. Exported for tests.
 export const GENERIC_GLINER_STOP_RE =
   /^(?:investors?|address(?:es)?|emails?(?:\s+ids?)?|demat\s+accounts?(?:\(s\))?|kra\s+data|registrars?|transfer\s+agents?|statements?|folios?|schemes?|holders?|nominees?)$/i;
-// Company/broker/fund/registrar names: never a person or personal address,
-// even when GLiNER labels them person/address.
-export const KNOWN_ENTITIES = [
-  "StashAway", "Motilal Oswal", "NSDL", "CDSL", "CAMS", "KFintech", "Karvy",
-  "Zerodha", "Groww", "Kotak", "HDFC", "ICICI", "SBI", "Axis",
-  "Franklin Templeton", "Vanguard", "Interactive Brokers", "IBKR",
-];
 // Fund/product words: a person hit immediately next to one is part of a
 // product name ("Motilal Oswal Nasdaq 100 FOF"), not a person.
 const FUND_WORDS = new Set(
   ["fund", "funds", "fof", "index", "indexes", "indices", "etf", "etfs", "plan", "plans", "growth", "direct", "regular", "scheme", "schemes", "nasdaq", "s&p"],
 );
-// Registrar/depository business addresses are not personal addresses.
-const INSTITUTIONAL_ADDRESS_RE = /\bdifc\b|dubai international financial|transfer agent|depositor(y|ies)/i;
 const MAX_RUNS = 12; // hard cap on Needle runs per chunk
 const EMPTY_RUNS_TO_STOP = 2; // stop after this many consecutive runs that find nothing new
 // Words that merely open a sentence; a capital letter on them says nothing.
@@ -103,21 +94,6 @@ export function isGenericGlinerStop(hit) {
   return n.length > 0 && GENERIC_GLINER_STOP_RE.test(n);
 }
 
-/** Company/broker/fund name? Rejects when the hit equals an entity or either side contains the other. */
-export function isKnownEntityHit(hit) {
-  const n = String(hit || "").trim().toLowerCase();
-  if (!n) return false;
-  return KNOWN_ENTITIES.some((e) => {
-    const en = e.toLowerCase();
-    if (n === en) return true;
-    // WHY substring both ways: the model returns both "Oswal" (hit inside
-    // entity) and "Motilal Oswal Nasdaq 100 FOF" (entity inside hit).
-    if (en.includes(n) && n.length >= 3) return true;
-    if (n.includes(en)) return new RegExp(`\\b${escapeRe(e.trim())}\\b`, "i").test(String(hit));
-    return false;
-  });
-}
-
 /**
  * Fund/product context? True when a fund word sits inside the hit or in the
  * ~3 words immediately before/after it in the window. Shared by _learnGliner
@@ -139,11 +115,6 @@ export function isFundAdjacent(hit, window) {
   const before = w.slice(0, m.index).trim().split(/\s+/).filter(Boolean).slice(-3);
   const after = w.slice(m.index + m[0].length).trim().split(/\s+/).filter(Boolean).slice(0, 3);
   return [...before, ...after].some((t) => FUND_WORDS.has(norm(t)));
-}
-
-/** Registrar/depository business address, not a personal one. */
-export function isInstitutionalAddress(hit) {
-  return INSTITUTIONAL_ADDRESS_RE.test(String(hit || ""));
 }
 
 /** Split text into model-sized chunks on sentence/line breaks. */
@@ -555,16 +526,14 @@ export class Redactor {
     }
     const isPerson = kind === "NAME";
     const isValue = kind === "ACCOUNT" || kind === "ID" || kind === "SECRET";
-    // Statement labels, broker/fund names and product-adjacent people are
-    // GLiNER false positives; real names/addresses never match these narrow
-    // lists. Same shared helper as _learnGliner so the older Needle path
-    // agrees with the GLiNER path.
+    // Statement labels and product-adjacent people are GLiNER false
+    // positives; real names/addresses never match these narrow lists. Same
+    // shared helper as _learnGliner so the older Needle path agrees with the
+    // GLiNER path.
     if (kind === "NAME" || kind === "ADDRESS") {
       if (isGenericGlinerStop(hit)) return null;
-      if (isKnownEntityHit(hit)) return null;
     }
     if (kind === "NAME" && isFundAdjacent(hit, working)) return null;
-    if (kind === "ADDRESS" && isInstitutionalAddress(hit)) return null;
     if (isValue) hit = cleanValue(raw);
     if (hit.length < 2 || hit.length > 140) return null;
     if (!isValue && /[:]/.test(hit)) return null;

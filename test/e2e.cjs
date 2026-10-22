@@ -22,7 +22,7 @@ const PII = {
 };
 const terminalDs = (ds) => ds === "done" || ds === "error";
 (async () => {
-  const b = await chromium.launch({ executablePath: "/opt/pw-browsers/chromium" });
+  const b = await chromium.launch(process.env.PW_CHROMIUM ? { executablePath: process.env.PW_CHROMIUM } : {});
   const p = await b.newPage({ viewport: { width: 900, height: 1100 } });
   const requests = [];
   // blob: URLs are same-origin memory (report CSV fetches below), not network.
@@ -236,8 +236,8 @@ const terminalDs = (ds) => ds === "done" || ds === "error";
   }, pdfNames);
   const normWs = (s) => String(s || "").replace(/\s+/g, " ").trim();
   const unguard = (q) => (/^'[=+\-@\t\r]/.test(q) ? q.slice(1) : q);
-  const XLSX_LIB = require("/home/user/pii-redactor/tools/node_modules/xlsx");
-  const JSZIP_LIB = require("/home/user/pii-redactor/tools/node_modules/jszip");
+  const XLSX_LIB = require(path.join(__dirname, "..", "tools", "node_modules", "xlsx"));
+  const JSZIP_LIB = require(path.join(__dirname, "..", "tools", "node_modules", "jszip"));
   const cellTextsOf = (filePath) => {
     const wb = XLSX_LIB.readFile(filePath, { cellDates: true });
     const vals = [];

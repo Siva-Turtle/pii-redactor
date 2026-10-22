@@ -6,6 +6,7 @@
 import { parseCsv, stringifyCsv, detectDelimiter } from "./csv.js";
 import { labelFor } from "./patterns.js";
 import { LLM_NOTICE } from "./notice.js";
+import { ocrCanvas, boxesForSpans, blacken, scaleBox, embeddedImageRects, cropForOcr } from "./ocr.js";
 import {
   unlockOffice,
   detectOfficeEncryption,
@@ -16,7 +17,7 @@ import {
 // Thorough mode costs roughly 10 s per paragraph, so the AI pass is time-boxed per file.
 const AI_TIME_BUDGET_MS = 10 * 60 * 1000;
 
-export const SUPPORTED = ["pdf", "xlsx", "xls", "csv", "txt", "md", "docx"];
+export const SUPPORTED = ["pdf", "xlsx", "xls", "csv", "txt", "md", "docx", "jpg", "jpeg", "png", "webp"];
 
 export const extOf = (name) => (name.split(".").pop() || "").toLowerCase();
 
@@ -83,10 +84,10 @@ function outName(name, ext) {
   return `${base}.redacted.${ext}`;
 }
 
-// Spreadsheet column headers that look like names but describe templates, funds or
-// statement fields. These must never trigger whole-column hiding.
+// Spreadsheet column headers that look like names but describe something else
+// (files, companies, banks, places…). These must never trigger whole-column hiding.
 const NAME_HEADER_BLOCK =
-  /file|sheet|company|bank|scheme|fund|product|plan|branch|city|state|country|nick|user|business|organi[sz]ation|entity|employer|goal|expense|income|asset|liability|liabilities|category|categories|item|head|particular|insurance|loan|investment|transaction|description|type|label/i;
+  /file|sheet|company|bank|scheme|fund|product|plan|branch|city|state|country|nick|user|business|organi[sz]ation|entity|employer/i;
 
 // Template / finance words that sit in a "Name" column but are not people.
 // WHY a set: a header such as "Name" or "Goal Name" hides the whole column,
@@ -104,11 +105,7 @@ export const LABEL_WORDS = new Set([
 ]);
 // Full-phrase labels (multi-word) that are never names even though each word is capitalised.
 const LABEL_PHRASES = new Set([
-  "fund total",
-  "total expenses",
   "statement period",
-  "rent & utilities",
-  "rent and utilities",
   "account holder",
   "client name",
   "account holder name",
@@ -469,6 +466,52 @@ async function redactXlsx(file, redactor, status, opts = {}) {
   };
 }
 
+// ------------------------------------------------------------------- pictures
+// Standalone JPG/PNG/WebP: OCR the pixels, run the SAME redactor over the
+// OCR text, burn black boxes into the pixels. All pixel budgets live here so
+// every handler (images, PDF pages, docx pictures) caps memory the same way.
+const PX_CAP = 16_000_000;
+const IMAGE_MIME = { jpg: "image/jpeg", jpeg: "image/jpeg", png: "image/png", webp: "image/png" };
+const IMAGE_OUT_EXT = { jpg: "jpg", jpeg: "jpeg", png: "png", webp: "png" }; // webp is saved as png
+
+const canvasBlob = (canvas, mime, quality) =>
+  new Promise((res, rej) => canvas.toBlob((b) => (b ? res(b) : rej(new Error("Could not encode the redacted picture."))), mime, quality));
+
+function drawBitmap(bitmap, scale) {
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.max(1, Math.round(bitmap.width * scale));
+  canvas.height = Math.max(1, Math.round(bitmap.height * scale));
+  canvas.getContext("2d").drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+  return canvas;
+}
+
+async function redactImage(file, redactor, status, ext) {
+  const warnings = [];
+  const bitmap = await createImageBitmap(file);
+  try {
+    // WHY two canvases: tiny phone photos need upscaling for the OCR engine
+    // to read them, but the saved file stays at (capped) original size.
+    const outScale = Math.min(1, Math.sqrt(PX_CAP / (bitmap.width * bitmap.height)));
+    const out = drawBitmap(bitmap, outScale);
+    const { canvas: work, k } = cropForOcr(out, { x0: 0, y0: 0, x1: out.width, y1: out.height });
+    status("Reading text in the picture…");
+    const { text, ranges } = await ocrCanvas(work);
+    await learnWithBudget(redactor, [text], status, warnings);
+    const spans = redactor.spans(text);
+    if (spans.length) {
+      const base = redactor.report.length;
+      redactor.count(spans, text);
+      tagReport(redactor, base, "image (OCR)");
+      blacken(out.getContext("2d"), boxesForSpans(spans, ranges).map((b) => scaleBox(b, 1 / k)));
+    }
+    const mime = IMAGE_MIME[ext] || "image/png";
+    const blob = await canvasBlob(out, mime, 0.92);
+    return { blob, name: outName(file.name, IMAGE_OUT_EXT[ext] || "png"), warnings, report: redactor.report.slice() };
+  } finally {
+    bitmap.close();
+  }
+}
+
 // -------------------------------------------------------------------- docx
 const W_PARTS = /^word\/(document|header\d*|footer\d*|footnotes|endnotes|comments)\.xml$/;
 
@@ -591,7 +634,41 @@ async function redactDocx(file, redactor, status, opts = {}) {
     }
   }
 
-  await learnWithBudget(redactor, paragraphs.map((p) => p.text), status, warnings);
+  // Pictures (word/media/*): OCR each one now so its text joins the learn
+  // pass with the rest of the file, then burn boxes into the pixels after.
+  const PIC_RE = /^word\/media\/[^/]+\.(png|jpe?g|webp)$/i;
+  const PIC_MIME = { png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", webp: "image/webp" };
+  const picNames = Object.keys(zip.files).filter((n) => PIC_RE.test(n));
+  const pictures = [];
+  let skippedPics = 0;
+  for (let n = 0; n < picNames.length; n++) {
+    const name = picNames[n];
+    try {
+      const bytes = await zip.file(name).async("uint8array");
+      const bitmap = await createImageBitmap(new Blob([bytes]));
+      try {
+        const scale = Math.min(1, Math.sqrt(PX_CAP / (bitmap.width * bitmap.height)));
+        const base = drawBitmap(bitmap, scale);
+        const { canvas: work, k } = cropForOcr(base, { x0: 0, y0: 0, x1: base.width, y1: base.height });
+        status(`Reading text in pictures… ${n + 1} of ${picNames.length}`);
+        const { text, ranges } = await ocrCanvas(work);
+        const ext = (name.split(".").pop() || "png").toLowerCase();
+        pictures.push({
+          name,
+          text,
+          ranges: ranges.map((rg) => ({ start: rg.start, end: rg.end, bbox: scaleBox(rg.bbox, 1 / k) })),
+          canvas: base,
+          mime: PIC_MIME[ext] || "image/png",
+        });
+      } finally {
+        bitmap.close();
+      }
+    } catch {
+      skippedPics++; // corrupt/unreadable picture: leave its bytes untouched
+    }
+  }
+
+  await learnWithBudget(redactor, [...paragraphs.map((p) => p.text), ...pictures.map((p) => p.text)], status, warnings);
 
   for (const p of paragraphs) {
     const spans = redactor.spans(p.text);
@@ -602,6 +679,22 @@ async function redactDocx(file, redactor, status, opts = {}) {
     redactor.count(spans, p.text);
     tagReport(redactor, base, p.location);
     applySpansToRuns(p.nodes, spans);
+  }
+  // Burn one black box per hit into each picture's pixels, then write the
+  // picture back into the zip under the same name (same format).
+  for (let n = 0; n < pictures.length; n++) {
+    const pic = pictures[n];
+    if (!pic.text) continue;
+    const spans = redactor.spans(pic.text);
+    if (!spans.length) continue;
+    const base = redactor.report.length;
+      redactor.count(spans, pic.text);
+      tagReport(redactor, base, `picture ${n + 1} (OCR)`);
+    blacken(pic.canvas.getContext("2d"), boxesForSpans(spans, pic.ranges));
+  }
+  for (const pic of pictures) {
+    const blob = await canvasBlob(pic.canvas, pic.mime, 0.92);
+    zip.file(pic.name, new Uint8Array(await blob.arrayBuffer()));
   }
   for (const { name, doc } of docs) {
     const part = partLabel(name);
@@ -672,8 +765,8 @@ async function redactDocx(file, redactor, status, opts = {}) {
   await strip("docProps/core.xml", ["dc:creator", "cp:lastModifiedBy"]);
   await strip("docProps/app.xml", ["Company", "Manager"]);
 
-  if (Object.keys(zip.files).some((n) => n.startsWith("word/media/")))
-    warnings.push("This document contains pictures. Text inside pictures is not read or hidden.");
+  if (pictures.length) warnings.push(`Checked ${pictures.length} picture(s) for hidden text.`);
+  if (skippedPics) warnings.push(`Skipped ${skippedPics} picture(s) that could not be read.`);
   warnings.push("Word files don't store page numbers, so locations below are paragraphs, tables, headers, footers, comments or footnotes — not pages.");
   const blob = await zip.generateAsync({
     type: "blob",
@@ -738,23 +831,116 @@ async function redactPdf(file, redactor, status, opts = {}) {
     const { text, entries } = pageText(content, unit, lib.Util);
     pages.push({ page, text, entries });
   }
-  const chars = pages.reduce((n, p) => n + p.text.replace(/\s/g, "").length, 0);
   // "Only remove the password": return the pages as pictures, with no black
   // boxes. The password is gone but so is selectable text; say so plainly.
   // (A scanned PDF is still a faithful copy in this mode, so it is returned.)
   const onlyUnlock = !!opts.onlyUnlock;
-  if (chars < 20 && !onlyUnlock) {
-    throw new FriendlyError(
-      "This PDF looks like a scan (a picture of a page), so there is no text to find. " +
-        "Run it through OCR first, then try again.",
-    );
+
+  // --- OCR pass (skipped for onlyUnlock: pages are copied as pictures there).
+  // A page with (almost) no text layer is a scan: OCR the whole canvas.
+  // Other pages contribute crops of their embedded pictures (e.g. a passport
+  // scan pasted into a text page). Rendering + OCR happen BEFORE the learn
+  // pass so names the model finds in OCR text also hide in the text layer
+  // and IDs learned from the text layer also hide in the OCR text.
+  const ocrByPage = pages.map(() => null);
+  const ocrScales = pages.map(() => 0);
+  let ocrPages = 0;
+  const cappedPages = [];
+  const nonWs = (t) => t.replace(/\s/g, "").length;
+  if (!onlyUnlock) {
+    const jobs = [];
+    for (let i = 0; i < pages.length; i++) {
+      const unit = pages[i].page.getViewport({ scale: 1 });
+      // ~300dpi equivalent on a letter page, capped like the normal path so
+      // a huge page cannot blow up memory (OCR accuracy drops badly below).
+      const scale = Math.min(4, Math.sqrt(PX_CAP / (unit.width * unit.height)));
+      ocrScales[i] = scale;
+      if (nonWs(pages[i].text) < 20) {
+        jobs.push({ i, rect: null });
+      } else {
+        const viewport = pages[i].page.getViewport({ scale });
+        const opList = await pages[i].page.getOperatorList();
+        const all = embeddedImageRects(opList, viewport, lib.OPS, lib.Util).filter(
+          (r) => r.x1 - r.x0 >= 120 && r.y1 - r.y0 >= 40, // logos/icons are too small for text
+        );
+        if (all.length > 8) cappedPages.push(i + 1); // catalogues: OCR the largest few
+        for (const rect of all.slice(0, 8)) jobs.push({ i, rect });
+      }
+    }
+    if (jobs.length) {
+      const canvases = new Map();
+      const renderFor = async (i) => {
+        if (!canvases.has(i)) {
+          const viewport = pages[i].page.getViewport({ scale: ocrScales[i] });
+          const canvas = document.createElement("canvas");
+          canvas.width = Math.ceil(viewport.width);
+          canvas.height = Math.ceil(viewport.height);
+          const ctx = canvas.getContext("2d");
+          ctx.fillStyle = "#fff";
+          ctx.fillRect(0, 0, canvas.width, canvas.height);
+          await pages[i].page.render({ canvasContext: ctx, viewport }).promise;
+          canvases.set(i, canvas);
+        }
+        return canvases.get(i);
+      };
+      const parts = pages.map(() => []);
+      let done = 0;
+      for (const job of jobs) {
+        done++;
+        status(`Reading text in pictures… ${done} of ${jobs.length}`);
+        const canvas = await renderFor(job.i);
+        if (!job.rect) {
+          const r = await ocrCanvas(canvas);
+          if (r.text) parts[job.i].push(r);
+        } else {
+          const { canvas: crop, x0, y0, k } = cropForOcr(canvas, job.rect);
+          const r = await ocrCanvas(crop);
+          if (r.text)
+            parts[job.i].push({
+              text: r.text,
+              ranges: r.ranges.map((rg) => ({
+                start: rg.start,
+                end: rg.end,
+                bbox: {
+                  x0: x0 + rg.bbox.x0 / k,
+                  y0: y0 + rg.bbox.y0 / k,
+                  x1: x0 + rg.bbox.x1 / k,
+                  y1: y0 + rg.bbox.y1 / k,
+                },
+              })),
+            });
+        }
+      }
+      canvases.clear();
+      for (let i = 0; i < pages.length; i++) {
+        if (!parts[i].length) continue;
+        // WHY re-offset here: each crop's ranges start at 0, but spans() runs
+        // on the joined page text, so ranges must carry joined offsets.
+        let text = "";
+        const ranges = [];
+        for (const part of parts[i]) {
+          if (text) text += "\n";
+          const off = text.length;
+          text += part.text;
+          for (const rg of part.ranges) ranges.push({ start: rg.start + off, end: rg.end + off, bbox: rg.bbox });
+        }
+        ocrByPage[i] = { text, ranges };
+        ocrPages++;
+      }
+    }
   }
-  const blank = pages.filter((p) => p.text.replace(/\s/g, "").length === 0).length;
-  if (blank)
-    warnings.push(`${blank} page(s) have no readable text (pictures only). They were copied as-is, so please check them by eye.`);
+  if (ocrPages) warnings.push(`Checked pictures on ${ocrPages} of ${pages.length} page(s) with offline OCR.`);
+  if (cappedPages.length)
+    warnings.push(`Page(s) ${cappedPages.join(", ")}: only the 8 largest pictures were checked.`);
 
   if (onlyUnlock) warnings.push("Password removed. Pages are saved as pictures, so the text in this PDF can no longer be selected.");
-  else await learnWithBudget(redactor, pages.map((p) => p.text), (t) => status(t.replace(/Looking for names and addresses… (\d+) of (\d+)/, "Scanning $1 of $2 pages...")), warnings);
+  else
+    await learnWithBudget(
+      redactor,
+      [...pages.map((p) => p.text), ...ocrByPage.map((o) => o?.text || "")],
+      (t) => status(t.replace(/Looking for names and addresses… (\d+) of (\d+)/, "Scanning $1 of $2 pages...")),
+      warnings,
+    );
 
   const measure = document.createElement("canvas").getContext("2d");
   const out = await PDFLib.PDFDocument.create();
@@ -762,7 +948,9 @@ async function redactPdf(file, redactor, status, opts = {}) {
     status(onlyUnlock ? `Copied ${i} of ${pages.length} pages...` : `Removed PIIs from ${i} of ${pages.length} pages...`);
     const { page, text } = pages[i];
     const unit = page.getViewport({ scale: 1 });
-    const scale = Math.min(2, Math.sqrt(16_000_000 / (unit.width * unit.height)));
+    const ocr = ocrByPage[i];
+    // OCR'd pages render at the OCR scale so the word boxes line up exactly.
+    const scale = ocr ? ocrScales[i] : Math.min(2, Math.sqrt(PX_CAP / (unit.width * unit.height)));
     const viewport = page.getViewport({ scale });
     const canvas = document.createElement("canvas");
     canvas.width = Math.ceil(viewport.width);
@@ -813,6 +1001,20 @@ async function redactPdf(file, redactor, status, opts = {}) {
       }
       }
     }
+    if (!onlyUnlock && ocr?.text) {
+      // Boxes over the OCR'd words (scan pages and embedded pictures),
+      // tagged so the report says where the text came from.
+      const ocrSpans = redactor.spans(ocr.text);
+      const base = redactor.report.length;
+      redactor.count(ocrSpans, ocr.text);
+      const pageNo = String(i + 1);
+      for (let k = base; k < redactor.report.length; k++) {
+        const e = redactor.report[k];
+        e.page = pageNo;
+        e.location = `page ${pageNo}, picture (OCR)`;
+      }
+      blacken(ctx, boxesForSpans(ocrSpans, ocr.ranges));
+    }
     const jpg = await new Promise((res) => canvas.toBlob(res, "image/jpeg", 0.85));
     const img = await out.embedJpg(new Uint8Array(await jpg.arrayBuffer()));
     const pdfPage = out.addPage([unit.width, unit.height]);
@@ -838,6 +1040,9 @@ async function redactPdf(file, redactor, status, opts = {}) {
     if (line) notePage.drawText(line, { x: 50, y, size, font });
   }
   status(onlyUnlock ? `Copied ${pages.length} of ${pages.length} pages...` : `Removed PIIs from ${pages.length} of ${pages.length} pages...`);
+  const blank = pages.filter((p, i) => !nonWs(p.text) && !nonWs(ocrByPage[i]?.text || "")).length;
+  if (blank)
+    warnings.push(`${blank} page(s) have no readable text (pictures only). They were copied as-is, so please check them by eye.`);
   if (!onlyUnlock) warnings.push("Pages are saved as pictures with black boxes, so the text in this PDF can no longer be selected.");
   const name = onlyUnlock ? file.name : outName(file.name, "pdf");
   if (onlyUnlock) {
@@ -892,8 +1097,13 @@ export async function redactFile(file, redactor, status, opts = {}) {
         return await redactDocx(file, redactor, status, opts);
       case "pdf":
         return await redactPdf(file, redactor, status, opts);
+      case "jpg":
+      case "jpeg":
+      case "png":
+      case "webp":
+        return await redactImage(file, redactor, status, ext);
       default:
-        throw new FriendlyError(`.${ext} files are not supported. Try PDF, Word (.docx), Excel, CSV, text or Markdown.`);
+        throw new FriendlyError(`.${ext} files are not supported. Try PDF, Word (.docx), Excel, CSV, text, Markdown or images (JPG, PNG, WebP).`);
     }
   } catch (err) {
     throw friendly(err, ext);

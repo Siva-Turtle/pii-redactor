@@ -75,12 +75,11 @@ export const RULES = [
     // digits but are still account references when labelled.
     accept: (m) => hasEnoughDigits(m) || (m.length >= 6 && /\d/.test(m) && /[A-Z]/i.test(m)),
   },
-  // WHY silent guards: broker/depository reference codes are not accounts.
-  // Transaction tokens (EP-DR…, Txn…, CtBo…, Acpt…) and 15-18 digit numbers
-  // cued within 20 chars by ref/reference/txn/… stay readable. They claim
-  // their ranges so CARD/ACCOUNT below skip them. Placed after the labelled
-  // rules so labelled numbers (a/c, folio, demat…) still hide.
-  { type: "TXN", silent: true, re: /\b(?:EP-DR|Txn|CtBo|Acpt)[-A-Za-z0-9]*\b/g },
+  // WHY silent guard: broker/depository reference numbers are not accounts.
+  // 15-18 digit numbers cued within 20 chars by ref/reference/txn/… stay
+  // readable. They claim their ranges so CARD/ACCOUNT below skip them.
+  // Placed after the labelled rules so labelled numbers (a/c, folio,
+  // demat…) still hide.
   // WHY group 1: only the digits are claimed; the cue word stays free.
   { type: "TXNREF", silent: true, group: 1, re: /\b(?:reference|transaction|ws\s+ref|ref|txn|order|trade|cams)[\s\S]{0,20}?(\d{15,18})\b/gid },
   // 16-digit card, optionally grouped in 4s; AMEX is 15 (4-6-5). Must precede SSN/AADHAAR/PHONE.
