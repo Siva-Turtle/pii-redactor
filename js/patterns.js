@@ -11,6 +11,14 @@ const MONTHS =
 
 const digitCount = (s) => s.replace(/\D/g, "").length;
 
+// WHY shared: a 15-18 digit number after ref/reference/txn/... is an order/
+// transaction reference, not a bank account. Checked with only the 20 chars
+// before the match so labelled "account no ..." numbers still hide.
+const REF_CUE = /(?:reference|transaction|ws\s+ref|ref|txn|order|trade|cams)\b/i;
+function isRefCued(text, start) {
+  return REF_CUE.test(text.slice(Math.max(0, start - 20), start));
+}
+
 // A number/ID value that follows a label, e.g. "a/c 5010 0234 5678", "folio no 1234567/89".
 // Hyphenated alphanumeric ids such as MS-A06F5B-E7 are one value, not separate groups.
 const VALUE = "((?:[A-Z]{1,4}-[A-Z0-9-]*\\d[A-Z0-9-]*|[A-Z]{0,4}\\d[A-Z0-9/-]*)(?:[ ]\\d[A-Z0-9/-]*){0,3})";
@@ -36,6 +44,11 @@ export const RULES = [
   { type: "TAN", re: /\b[A-Z]{4}[0-9]{5}[A-Z]\b/g },
   // Bank IFSC: 4 letters, literal 0, 6 alphanumeric (e.g. HDFC0001234).
   { type: "IFSC", re: /\b[A-Z]{4}0[A-Z0-9]{6}\b/gi },
+  // WHY silent guard: ISINs (INE/INF + 9 alphanumerics, 12 chars) are public
+  // security codes, not accounts. Claims the range so no later rule hides it.
+  // Placed before DEMAT/ACCOUNT; the real demat (IN + 6 digits + 8 digits,
+  // third char a digit) never matches INE/INF so it still hides.
+  { type: "ISIN", silent: true, re: /\b(?:INE|INF)[0-9A-Z]{9}\b/g },
   // NSDL demat (BO) ID: "IN" + 6-digit DP ID + 8-digit client ID, e.g. IN300123 10234567.
   { type: "DEMAT", re: /\bIN\d{6}[ -]?\d{8}\b/g },
   { type: "IP", re: /\b(?:\d{1,3}\.){3}\d{1,3}\b/g },
@@ -43,7 +56,7 @@ export const RULES = [
   { type: "AADHAAR", group: 1, re: labelled("aadhaar|aadhar|uidai|uid"), accept: (m) => digitCount(m) >= 12 },
   { type: "SSN", group: 1, re: labelled("ssn|social security(?: number)?"), accept: (m) => digitCount(m) >= 9 },
   { type: "CARD", group: 1, re: labelled("(?:credit |debit )?card"), accept: (m) => digitCount(m) >= 13 },
-  { type: "DEMAT", group: 1, re: labelled("demat(?: a\\/c| account)?|bo[ -]?id|dp[ -]?id|client[ -]?id|beneficiary(?: owner)? id"), accept: hasEnoughDigits },
+  { type: "DEMAT", group: 1, re: labelled("demat(?: a\\/c| account)?|bo[ -]?id|dp[ -]?id|client[ -]?id|beneficiary(?: owner)? id|nsdl[ -]?id|nsdl"), accept: hasEnoughDigits },
   { type: "FOLIO", group: 1, re: labelled("folio"), accept: hasEnoughDigits },
   { type: "POLICY", group: 1, re: labelled("policy|pran|uan|ckyc|nps"), accept: hasEnoughDigits },
   {
@@ -62,6 +75,14 @@ export const RULES = [
     // digits but are still account references when labelled.
     accept: (m) => hasEnoughDigits(m) || (m.length >= 6 && /\d/.test(m) && /[A-Z]/i.test(m)),
   },
+  // WHY silent guards: broker/depository reference codes are not accounts.
+  // Transaction tokens (EP-DR…, Txn…, CtBo…, Acpt…) and 15-18 digit numbers
+  // cued within 20 chars by ref/reference/txn/… stay readable. They claim
+  // their ranges so CARD/ACCOUNT below skip them. Placed after the labelled
+  // rules so labelled numbers (a/c, folio, demat…) still hide.
+  { type: "TXN", silent: true, re: /\b(?:EP-DR|Txn|CtBo|Acpt)[-A-Za-z0-9]*\b/g },
+  // WHY group 1: only the digits are claimed; the cue word stays free.
+  { type: "TXNREF", silent: true, group: 1, re: /\b(?:reference|transaction|ws\s+ref|ref|txn|order|trade|cams)[\s\S]{0,20}?(\d{15,18})\b/gid },
   // 16-digit card, optionally grouped in 4s; AMEX is 15 (4-6-5). Must precede SSN/AADHAAR/PHONE.
   { type: "CARD", re: /\b(?:\d{4}[ -]?){3}\d{4}\b/g },
   { type: "CARD", re: /\b3[47]\d{2}[ -]?\d{6}[ -]?\d{5}\b/g },
@@ -71,7 +92,9 @@ export const RULES = [
   { type: "ID", re: /\b[A-Z]{3}\d{7}\b/g },
   { type: "AADHAAR", re: /\b(?:\d{4}[ -]?){2}\d{4}\b/g },
   // Long bank account numbers with no label. Must precede PHONE, which would eat the first 15 digits.
-  { type: "ACCOUNT", re: /\b\d{15,18}\b/g },
+  // WHY accept: skip 15-18 digit numbers cued as order/transaction references
+  // (guard above already claims most, this covers any ordering edge).
+  { type: "ACCOUNT", re: /\b\d{15,18}\b/g, accept: (m, text, start) => !isRefCued(text, start) },
   // Dates (DOBs double as passwords on Form 16 / bank statements, so they are
   // PII). Toggleable because ordinary calendar dates are masked too.
   {
@@ -111,12 +134,14 @@ export function findPatternSpans(text, { dates = true } = {}) {
   const spans = [];
   for (const rule of RULES) {
     // With dates off, the DATE rule still runs to claim its ranges (so the loose
-    // PHONE pattern cannot swallow them) but emits no span.
-    const silent = rule.optional === "dates" && !dates;
+    // PHONE pattern cannot swallow them) but emits no span. Rules with
+    // silent:true always claim without emitting (ISIN / transaction refs).
+    const silent = rule.silent || (rule.optional === "dates" && !dates);
     rule.re.lastIndex = 0;
     for (const m of text.matchAll(rule.re)) {
       const [start, end] = rule.group ? m.indices[rule.group] : [m.index, m.index + m[0].length];
-      if (rule.accept && !rule.accept(text.slice(start, end))) continue;
+      // WHY extra args: the ACCOUNT guard needs the 20 chars before the match.
+      if (rule.accept && !rule.accept(text.slice(start, end), text, start)) continue;
       let free = true;
       for (let i = start; i < end; i++) {
         if (taken[i]) {

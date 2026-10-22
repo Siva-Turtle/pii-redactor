@@ -289,6 +289,37 @@ assert.strictEqual(cleanHit("Dr Priya Nair."), "Priya Nair");
   for (const h of ["Amount", "Units", "Scheme Name", "Company name", "Notes", "File name"]) assert.strictEqual(headerType(h), null, h);
 }
 
+// --- spreadsheet NAME false positives: template headers, label cells, key-value ---
+{
+  const { headerType, isNameLike, shouldHideNameColumn, NAME_LABEL_RE, LABEL_WORDS } = await import("../js/handlers.js");
+  // (a) template / statement headers must not be NAME
+  for (const h of ["Goal Name", "Expense Name", "Income Name", "Asset Name", "Liability Name", "Category Name", "Item Name", "Head Name", "Particulars Name", "Insurance Name", "Loan Name", "Investment Name", "Transaction Name", "Description Name", "Type Name", "Label Name"])
+    assert.strictEqual(headerType(h), null, h);
+  assert.strictEqual(headerType("Client Name"), "NAME", "real person header still NAME");
+  // (b) template labels are not name-shaped; real names are
+  for (const cell of ["Self", "Spouse", "Child", "Salary", "Total Expenses", "Fund Total", "PAN", "Statement Period", "Rent & Utilities"])
+    assert.strictEqual(isNameLike(cell), false, cell);
+  assert.strictEqual(isNameLike("Anita Desai"), true);
+  assert.strictEqual(isNameLike("Rajesh Kumar Sharma"), true);
+  assert.strictEqual(isNameLike("Anita123"), false, "digits are never names");
+  assert.ok(LABEL_WORDS.has("spouse") && LABEL_WORDS.has("pan") && LABEL_WORDS.has("client"), "label set covers task words");
+  // column hides only when half the data looks like names
+  assert.strictEqual(shouldHideNameColumn(["Self", "Spouse", "Child", "Salary"]), false, "template column stays");
+  assert.strictEqual(shouldHideNameColumn(["Anita Desai", "Rajesh Kumar", "Self"]), true, "2/3 names hides");
+  assert.strictEqual(shouldHideNameColumn(["Anita Desai", "Self", "Salary", "Total Expenses"]), false, "1/4 names leaves to AI path");
+  assert.strictEqual(shouldHideNameColumn([]), false, "empty column never hides");
+  // (c) key-value labels match; values with digits do not qualify
+  for (const label of ["Name", "Name:", "Client Name", "Client Name:", "Investor Name", "Account Holder Name:"]) {
+    assert.match(label, NAME_LABEL_RE, label);
+    const { isHidableValue } = await import("../js/handlers.js");
+    assert.strictEqual(isHidableValue("Anita Desai"), true, label);
+    assert.strictEqual(isHidableValue(""), false);
+    assert.strictEqual(isHidableValue("12345"), false, "numeric neighbour is not a name");
+    assert.strictEqual(isHidableValue("42 MG Road"), false, "digits disqualify");
+  }
+  assert.doesNotMatch("Company Name", NAME_LABEL_RE, "company headers are not key-value labels");
+}
+
 // --- password-protected Office files (js/office-crypto.js) ---
 {
   const hex = (s) => Uint8Array.from(Buffer.from(s, "hex"));
@@ -558,6 +589,46 @@ assert.strictEqual(cleanHit("Dr Priya Nair."), "Priya Nair");
   assert.match(mask("customer id AB12CD34"), /\[ACCOUNT\]/);
 }
 
+// --- broker/depository reference codes stay readable (not ACCOUNT/ID)
+{
+  // ISINs (INE/INF + 9 alphanumerics) stay
+  for (const ok of ["ISIN INF247L01023 held", "security INE123A45678 noted", "INF247L01023"]) {
+    const out = mask(ok);
+    assert.doesNotMatch(out, /\[ACCOUNT\]|\[ID\]|\[DEMAT\]|\[CARD\]/, ok);
+    assert.strictEqual(out, ok, ok);
+  }
+  // the real demat rule still wins
+  assert.match(mask("IN300123 10234567"), /\[DEMAT\]/, "spaced demat hides");
+  assert.match(mask("IN30012310234567"), /\[DEMAT\]/, "unspaced demat hides");
+  // transaction tokens stay (hyphenated forms would otherwise lose digits to ACCOUNT)
+  for (const ok of ["EP-DR-123456", "EP-DR-1234567890123456", "Txn-1234567890123456", "CtBo98765", "Acpt20240115"]) {
+    const out = mask(`note ${ok} held`);
+    assert.doesNotMatch(out, /\[/, ok);
+    assert.ok(out.includes(ok), `${ok} leaked into brackets: ${out}`);
+  }
+  // 15-18 digit numbers cued as references stay
+  for (const ok of ["Ref 1234567890123456", "Reference: 123456789012345678", "Txn 123456789012345", "Transaction 1234567890123456", "Order 1234567890123456", "Trade 1234567890123456", "CAMS 1234567890123456", "WS Ref 1234567890123456"]) {
+    const out = mask(ok);
+    assert.doesNotMatch(out, /\[ACCOUNT\]|\[CARD\]/, ok);
+    assert.ok(/\d{15,18}/.test(out), `${ok} digits lost: ${out}`);
+  }
+  // unlabeled long numbers without a cue still hide
+  assert.match(mask("1234567890123456"), /\[CARD\]|\[ACCOUNT\]/, "uncued 16-digit hides");
+  assert.match(mask("Account 123456789012345678 held"), /\[ACCOUNT\]/, "uncued 18-digit hides");
+  // price-like decimals stay
+  assert.strictEqual(mask("Price 161.1706 noted"), "Price 161.1706 noted");
+  // labelled numbers still hide
+  assert.match(mask("account no 1234567890123456"), /\[ACCOUNT\]/, "labelled 16-digit hides");
+  assert.match(mask("a/c 5010 0234 5678 91 at Axis"), /\[ACCOUNT\]/, "labelled a/c hides");
+  // _accept rejects ISINs and price decimals for ID/ACCOUNT only
+  const rr = new Redactor();
+  assert.strictEqual(rr._accept("INF247L01023", "ID", "holding INF247L01023 here"), null, "ISIN id");
+  assert.strictEqual(rr._accept("INE123A45678", "ACCOUNT", "holding INE123A45678 here"), null, "ISIN account");
+  assert.strictEqual(rr._accept("161.1706", "ACCOUNT", "price 161.1706 here"), null, "decimal account");
+  assert.strictEqual(rr._accept("161.1706", "ID", "price 161.1706 here"), null, "decimal id");
+  assert.ok(rr._accept("Priya Nair", "NAME", "contact Priya Nair today"), "real name stays");
+}
+
 // --- LLM notice: exact text appended to every output type
 {
   const { LLM_NOTICE } = await import("../js/notice.js");
@@ -580,5 +651,98 @@ assert.strictEqual(cleanHit("Dr Priya Nair."), "Priya Nair");
   assert.ok(email, "email found");
   assert.strictEqual(text.slice(email.start, email.end), "ana@example.com");
   assert.match(mask(text), /\[EMAIL\]\nStatement/);
+}
+// --- GLiNER name/address false positives: statement labels, known entities, fund context
+{
+  const { GENERIC_GLINER_STOP_RE, KNOWN_ENTITIES, isGenericGlinerStop, isKnownEntityHit, isFundAdjacent, isInstitutionalAddress } = await import("../js/redactor.js");
+  const r = new Redactor();
+  // (a) generic statement labels are never NAME/ADDRESS (whole hit, case-insensitive, trailing punctuation ok)
+  const generic = ["Investor", "investors", "address,", "email id", "Email", "demat account", "demat accounts", "demat account(s)", "KRA Data", "Registrar", "Transfer Agent", "statement", "STATEMENTS", "folio", "folios", "Scheme", "holder", "holders", "Nominee", "nominees"];
+  assert.ok(Array.isArray(KNOWN_ENTITIES) && KNOWN_ENTITIES.length >= 10, "known-entity list present");
+  for (const h of generic) {
+    assert.ok(isGenericGlinerStop(h), `${h} is a generic stop`);
+    assert.ok(GENERIC_GLINER_STOP_RE.test(h.replace(/[\s,;:.]+$/, "")), h);
+    assert.strictEqual(r._accept(h, "NAME", `Note about ${h} filed here`), null, h);
+    assert.strictEqual(r._accept(h, "ADDRESS", `Note about ${h} filed here`), null, h);
+  }
+  // real names and real addresses are unaffected by the generic stop
+  assert.strictEqual(isGenericGlinerStop("Priya Nair"), false);
+  assert.ok(r._accept("Priya Nair", "NAME", "Please contact Priya Nair today"), "real name stays");
+  assert.ok(r._accept("Flat 12B, Sunrise Apartments, Andheri West, Mumbai 400053", "ADDRESS", "Address: Flat 12B, Sunrise Apartments, Andheri West, Mumbai 400053 here"), "real address stays");
+  // (b) company/broker/fund/registrar names are never NAME/ADDRESS
+  for (const h of ["StashAway", "Motilal Oswal", "Oswal", "Zerodha", "Franklin Templeton", "Interactive Brokers", "Motilal Oswal Nasdaq Fund"]) {
+    assert.ok(isKnownEntityHit(h), `${h} is a known entity`);
+    assert.strictEqual(r._accept(h, "NAME", `Account with ${h} held here today`), null, h);
+    assert.strictEqual(r._accept(h, "ADDRESS", `Account with ${h} held here today`), null, h);
+  }
+  assert.strictEqual(isKnownEntityHit("Priya Nair"), false, "real name is not a known entity");
+  // (c) a person hit next to a fund/product word is a product name (shared helper: GLiNER + older path)
+  assert.strictEqual(isFundAdjacent("Motilal Oswal", "Motilal Oswal Nasdaq 100 FOF details"), true);
+  assert.strictEqual(isFundAdjacent("Priya Nair", "Please contact Priya Nair today"), false);
+  assert.strictEqual(r._accept("Motilal Oswal", "NAME", "Holding Motilal Oswal Nasdaq 100 FOF units"), null, "fund-adjacent person");
+  assert.strictEqual(r._accept("Motilal Oswal Nasdaq Fund", "NAME", "Holding Motilal Oswal Nasdaq Fund units"), null, "fund words inside the hit");
+  assert.ok(r._accept("Priya Nair", "NAME", "Please contact Priya Nair today"), "mid-sentence real name stays");
+  // registrar/depository business addresses are not personal addresses
+  for (const h of ["Level 14, DIFC, Dubai", "Dubai International Financial Centre, Dubai", "CAMS Transfer Agent office, Chennai", "NSDL Depository, Mumbai"]) {
+    assert.ok(isInstitutionalAddress(h), `${h} is institutional`);
+    assert.strictEqual(r._accept(h, "ADDRESS", `Office: ${h} open today`), null, h);
+  }
+  assert.strictEqual(isInstitutionalAddress("Flat 12B, Andheri West, Mumbai 400053"), false);
+  // end-to-end through the GLiNER path: a fund-adjacent person is never learned
+  {
+    const det = { size: 1, recognize: async () => [{ label: "person", word: "Motilal Oswal", score: 0.9 }] };
+    const g = new Redactor({ detector: det });
+    const doc = "Holding Motilal Oswal Nasdaq 100 FOF units today";
+    await g.learn([doc]);
+    assert.strictEqual(g.apply(doc), doc, "fund product name survives the GLiNER path");
+  }
+}
+
+// --- pattern-found ID propagation: labelled once, hidden everywhere
+{
+  // NSDL ID label hides via the labelled DEMAT rule
+  assert.match(mask("NSDL ID 12081600 held"), /\[DEMAT\]/, "NSDL ID label");
+  assert.ok(!mask("NSDL ID 12081600 held").includes("12081600"), "NSDL ID value hidden");
+  assert.match(mask("NSDL 12081600 held"), /\[DEMAT\]/, "NSDL bare label");
+
+  // bracketed ID: learnt with label, hidden inside brackets elsewhere
+  {
+    const r = new Redactor();
+    await r.learn(["DP ID: IN302814 on page 2"]);
+    const out = r.apply("holding (IN302814) on page 10");
+    assert.ok(!out.includes("IN302814"), `bracketed leak: ${out}`);
+    assert.match(out, /\[DEMAT\]/);
+    assert.strictEqual(r.report[0].source, "script");
+    assert.strictEqual(r.report[0].rule, "DEMAT");
+  }
+  // ID on its own line / alone in a table cell
+  {
+    const r = new Redactor();
+    await r.learn(["Client ID IN302814 confirmed"]);
+    assert.strictEqual(r.apply("IN302814"), "[DEMAT]");
+    assert.strictEqual(r.apply("cell IN302814 end"), "cell [DEMAT] end");
+  }
+  // earlier occurrence is caught too (learn sees the whole file before rendering)
+  {
+    const r = new Redactor();
+    await r.learn(["page 10 has (IN302814) in a table", "page 2 DP ID: IN302814"]);
+    assert.strictEqual(r.apply("page 10 has (IN302814) in a table"), "page 10 has ([DEMAT]) in a table");
+  }
+  // folio with a trailing '/ NN' suffix: the number part hides elsewhere
+  {
+    const r = new Redactor();
+    await r.learn(["folio no 12345678/45 verified"]);
+    const out = r.apply("balance 12345678 / 45 held");
+    assert.ok(!out.includes("12345678"), `folio leak: ${out}`);
+    assert.match(out, /\[FOLIO\]/);
+  }
+  // non-regression: unrelated numbers stay readable
+  {
+    const r = new Redactor();
+    await r.learn(["DP ID: IN302814", "folio no 12345678/45"]);
+    assert.strictEqual(r.apply("note 87654321 held"), "note 87654321 held");
+    assert.strictEqual(r.apply("quantity 561 units"), "quantity 561 units");
+    assert.ok(r.apply("prefix IN3028140 suffix").includes("IN3028140"), "longer number must not partially match");
+  }
 }
 console.log("All unit tests passed.");

@@ -32,6 +32,26 @@ const GLINER_MIN_SINGLE = 0.45;
 // Statement vocabulary and share-plan words that GLiNER mistakes for
 // people/places; keeps stock names, dates and amounts readable.
 const GLINER_NOT_PII = /\b(?:GSUs?|RSUs?|Vest(?:ed|ing)?|Page|Grant|Tax|IRS|Alien|Nonresident|Account|Summary|Total|Release|Plan|Share|Savings|Stock|Price|Value|Activity|Balance|Dividend|Inc|Alphabet|Google|Class|NASDAQ)\b|^[A-Z]{2,6}$|\d{1,2}-[A-Z][a-z]{2}-\d{4}/;
+// Generic statement labels GLiNER reports as person/address ("Investor",
+// "email id", "demat account(s)", "KRA Data", "Registrar", ...). Matched
+// case-insensitively on the whole hit after trimming punctuation; singular,
+// plural and a trailing "(s)" all count. Exported for tests.
+export const GENERIC_GLINER_STOP_RE =
+  /^(?:investors?|address(?:es)?|emails?(?:\s+ids?)?|demat\s+accounts?(?:\(s\))?|kra\s+data|registrars?|transfer\s+agents?|statements?|folios?|schemes?|holders?|nominees?)$/i;
+// Company/broker/fund/registrar names: never a person or personal address,
+// even when GLiNER labels them person/address.
+export const KNOWN_ENTITIES = [
+  "StashAway", "Motilal Oswal", "NSDL", "CDSL", "CAMS", "KFintech", "Karvy",
+  "Zerodha", "Groww", "Kotak", "HDFC", "ICICI", "SBI", "Axis",
+  "Franklin Templeton", "Vanguard", "Interactive Brokers", "IBKR",
+];
+// Fund/product words: a person hit immediately next to one is part of a
+// product name ("Motilal Oswal Nasdaq 100 FOF"), not a person.
+const FUND_WORDS = new Set(
+  ["fund", "funds", "fof", "index", "indexes", "indices", "etf", "etfs", "plan", "plans", "growth", "direct", "regular", "scheme", "schemes", "nasdaq", "s&p"],
+);
+// Registrar/depository business addresses are not personal addresses.
+const INSTITUTIONAL_ADDRESS_RE = /\bdifc\b|dubai international financial|transfer agent|depositor(y|ies)/i;
 const MAX_RUNS = 12; // hard cap on Needle runs per chunk
 const EMPTY_RUNS_TO_STOP = 2; // stop after this many consecutive runs that find nothing new
 // Words that merely open a sentence; a capital letter on them says nothing.
@@ -68,6 +88,63 @@ const MONEY = /^[\s(\-+]*(?:(?:US|A|C|S|HK)?\$|USD|INR|Rs\.?|₹|€|£|¥)?\s*[
 const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 const wsRe = (s) => escapeRe(s).replace(/\s+/g, "\\s+");
 const normKey = (s) => s.replace(/\s+/g, " ").trim().toLowerCase();
+
+// Pattern-found identifiers that must hide everywhere, even without their
+// label: a DEMAT/FOLIO/ACCOUNT/ID value seen once with its label is
+// remembered in normalised form (uppercase, alphanumerics only) and matched
+// tolerantly (single spaces/hyphens between chars, brackets/punctuation
+// around it). FOLIO also remembers the number before a "/ NN" suffix.
+const PROP_TYPES = new Set(["DEMAT", "FOLIO", "ACCOUNT", "ID"]);
+const normId = (s) => String(s || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
+
+/** Whole-hit generic label? Case-insensitive, trailing punctuation ignored. */
+export function isGenericGlinerStop(hit) {
+  const n = String(hit || "").trim().replace(/[\s,;:.]+$/, "").trim();
+  return n.length > 0 && GENERIC_GLINER_STOP_RE.test(n);
+}
+
+/** Company/broker/fund name? Rejects when the hit equals an entity or either side contains the other. */
+export function isKnownEntityHit(hit) {
+  const n = String(hit || "").trim().toLowerCase();
+  if (!n) return false;
+  return KNOWN_ENTITIES.some((e) => {
+    const en = e.toLowerCase();
+    if (n === en) return true;
+    // WHY substring both ways: the model returns both "Oswal" (hit inside
+    // entity) and "Motilal Oswal Nasdaq 100 FOF" (entity inside hit).
+    if (en.includes(n) && n.length >= 3) return true;
+    if (n.includes(en)) return new RegExp(`\\b${escapeRe(e.trim())}\\b`, "i").test(String(hit));
+    return false;
+  });
+}
+
+/**
+ * Fund/product context? True when a fund word sits inside the hit or in the
+ * ~3 words immediately before/after it in the window. Shared by _learnGliner
+ * (GLiNER window) and _accept (Needle working text) so both paths agree.
+ */
+export function isFundAdjacent(hit, window) {
+  const h = String(hit || "").trim();
+  const w = String(window || "");
+  if (!h || !w) return false;
+  const norm = (t) => t.replace(/^[^A-Za-z&]+|[^A-Za-z&]+$/g, "").toLowerCase();
+  if (h.split(/\s+/).some((t) => FUND_WORDS.has(norm(t)))) return true;
+  let m;
+  try {
+    m = new RegExp(wsRe(h), "i").exec(w);
+  } catch {
+    return false;
+  }
+  if (!m) return false;
+  const before = w.slice(0, m.index).trim().split(/\s+/).filter(Boolean).slice(-3);
+  const after = w.slice(m.index + m[0].length).trim().split(/\s+/).filter(Boolean).slice(0, 3);
+  return [...before, ...after].some((t) => FUND_WORDS.has(norm(t)));
+}
+
+/** Registrar/depository business address, not a personal one. */
+export function isInstitutionalAddress(hit) {
+  return INSTITUTIONAL_ADDRESS_RE.test(String(hit || ""));
+}
 
 /** Split text into model-sized chunks on sentence/line breaks. */
 export function chunkText(text) {
@@ -187,6 +264,10 @@ export class Redactor {
     this.report = []; // per-file redaction report entries (in-memory only)
     this.termProv = new Map(); // norm term -> {source,...}, first discovery wins
     this.tokenProv = new Map(); // exact token -> {source,...}
+    this.propagated = new Map(); // norm id -> {type,source,rule}, first labelled hit wins
+    this._propRe = null; // combined propagated-ID matcher, rebuilt when propagated.size changes
+    this._propReSize = 0;
+    this._learned = new Set(); // texts already passed to _learnPatterns
   }
 
   /** Reset the per-file tally (terms learned in earlier files are kept out too). */
@@ -199,14 +280,107 @@ export class Redactor {
     this.report = [];
     this.termProv = new Map();
     this.tokenProv = new Map();
+    this.propagated = new Map();
+    this._propRe = null;
+    this._propReSize = 0;
+    this._learned = new Set();
   }
 
   /**
    * AI pass. `texts` is every text fragment of the file. Returns how many
    * chunks were scanned and whether the budget cut the scan short.
    */
+  /**
+   * WHY propagation: a labelled ID (DP ID: IN302814) must also hide where it
+   * appears without its label ((IN302814), a table cell, its own line). Runs
+   * over every text passed to learn() so earlier pages learn from later ones.
+   */
+  _learnPatterns(text) {
+    if (!text) return;
+    let spans;
+    try {
+      spans = findPatternSpans(text, { dates: true });
+    } catch {
+      return;
+    }
+    for (const s of spans) {
+      if (!PROP_TYPES.has(s.type)) continue;
+      const raw = text.slice(s.start, s.end);
+      const norm = normId(raw);
+      // WHY length + digit + common-word guards: short codes and plain words
+      // (pin code, policy) must never become file-wide matchers.
+      if (norm.length < 5 || !/\d/.test(norm)) continue;
+      if (NOT_A_SECRET.test(raw.trim())) continue;
+      if (!this.propagated.has(norm)) this.propagated.set(norm, { type: s.type, source: s.source, rule: s.rule });
+      // WHY folio base: "12345678 / 45" elsewhere shares only the number
+      // before the "/ NN" suffix, so that part hides on its own.
+      if (s.type === "FOLIO" && raw.includes("/")) {
+        const base = normId(raw.split("/")[0]);
+        if (base.length >= 5 && /\d/.test(base) && !this.propagated.has(base))
+          this.propagated.set(base, { type: s.type, source: s.source, rule: s.rule });
+      }
+    }
+  }
+
+  /** Tolerant file-wide matches for propagated IDs, honouring `taken`. */
+  _propSpans(text, taken) {
+    const out = [];
+    if (!this.propagated.size) return out;
+    // WHY one combined regex: per-ID RegExp per call is too slow on big files.
+    // Rebuilt only when propagated.size changes; alternation stays longest
+    // first so a folio base and its full form overlap with the longer winning.
+    if (!this._propRe || this._propReSize !== this.propagated.size) {
+      const keys = [...this.propagated.keys()].filter((k) => k.length >= 5).sort((a, b) => b.length - a.length);
+      if (!keys.length) {
+        this._propRe = null;
+        this._propReSize = this.propagated.size;
+        return out;
+      }
+      // WHY single separator only: "IN 302814" matches, but prose spanning
+      // two words never fuses into an ID.
+      const body = keys.map((k) => k.split("").join("[ \\-]?")).join("|");
+      try {
+        this._propRe = new RegExp(`(?<![A-Za-z0-9])(?:${body})(?![A-Za-z0-9])`, "gi");
+      } catch {
+        this._propRe = null;
+        this._propReSize = this.propagated.size;
+        return out;
+      }
+      this._propReSize = this.propagated.size;
+    }
+    const re = this._propRe;
+    if (!re) return out;
+    re.lastIndex = 0;
+    for (const m of text.matchAll(re)) {
+      // WHY normId lookup: the tolerant match (spaces/hyphens, any case)
+      // normalises back to the propagated key that owns the provenance.
+      const prov = this.propagated.get(normId(m[0]));
+      if (!prov) continue;
+      const start = m.index;
+      const end = start + m[0].length;
+      let free = true;
+      for (let i = start; i < end; i++) {
+        if (taken[i]) {
+          free = false;
+          break;
+        }
+      }
+      if (!free) continue;
+      taken.fill(1, start, end);
+      // WHY script provenance: the report still says which pattern rule
+      // first found the value, even though it appears here without a label.
+      out.push({ start, end, type: prov.type, source: prov.source, rule: prov.rule });
+    }
+    return out;
+  }
+
   async learn(texts, { onProgress, maxChunks = Infinity, maxMs = Infinity } = {}) {
-    for (const t of texts) if (t) this._learnCues(t);
+    for (const t of texts) {
+      if (!t) continue;
+      this._learnCues(t);
+      this._learnPatterns(t);
+      this._learned.add(t);
+    }
     if (!this.detector) return { scanned: 0, total: 0, truncated: false };
     // GLiNER detectors expose recognize(); anything else is the legacy
     // per-question Needle path kept for tests.
@@ -266,6 +440,10 @@ export class Redactor {
           const raw = e.word.replace(/\s+/g, " ").trim();
           if (GLINER_NOT_PII.test(raw) || /^(?:RB|C)?[0-9A-F]{6,}$/i.test(raw) || !/\p{L}{3,}/u.test(raw)) continue;
           if (kind === "NAME" && !raw.split(" ").every((x) => /^\p{Lu}[\p{L}'.-]*$/u.test(x))) continue;
+          // WHY shared helper here as well as in _accept: the GLiNER window is
+          // available at this point, so product names skip before grounding;
+          // _accept repeats the check on its working text for the older path.
+          if (kind === "NAME" && isFundAdjacent(raw, w)) continue;
           const found = this._accept(raw, kind, w.replace(/\n/g, " "));
           if (found) this._addTerm(found.term, found.kind, { source: "gliner", label: e.label, score: +e.score.toFixed(2) });
         }
@@ -377,11 +555,26 @@ export class Redactor {
     }
     const isPerson = kind === "NAME";
     const isValue = kind === "ACCOUNT" || kind === "ID" || kind === "SECRET";
+    // Statement labels, broker/fund names and product-adjacent people are
+    // GLiNER false positives; real names/addresses never match these narrow
+    // lists. Same shared helper as _learnGliner so the older Needle path
+    // agrees with the GLiNER path.
+    if (kind === "NAME" || kind === "ADDRESS") {
+      if (isGenericGlinerStop(hit)) return null;
+      if (isKnownEntityHit(hit)) return null;
+    }
+    if (kind === "NAME" && isFundAdjacent(hit, working)) return null;
+    if (kind === "ADDRESS" && isInstitutionalAddress(hit)) return null;
     if (isValue) hit = cleanValue(raw);
     if (hit.length < 2 || hit.length > 140) return null;
     if (!isValue && /[:]/.test(hit)) return null;
     if (isValue) {
       if (kind !== "SECRET" && (!/\d/.test(hit) || hit.length < 5)) return null;
+      // WHY: ISINs (INF/INE + 9 chars) and price decimals (161.1706) are
+      // broker-statement references, not accounts/IDs. Pattern-layer labelled
+      // numbers (a/c, folio, demat…) bypass _accept, so they still hide.
+      if ((kind === "ACCOUNT" || kind === "ID") && /^(?:INE|INF)[0-9A-Z]{9}$/i.test(hit)) return null;
+      if ((kind === "ACCOUNT" || kind === "ID") && /\d+\.\d{4,}/.test(hit)) return null;
       // An account/ID is one compact token (or a few digit groups), never a phrase.
       if (kind !== "SECRET" && (/,/.test(hit) || (hit.match(/\p{L}{3,}/gu) || []).length > 1)) return null;
       if (kind === "SECRET" && (hit.length < 4 || NOT_A_SECRET.test(hit))) return null;
@@ -473,6 +666,14 @@ export class Redactor {
 
   spans(text) {
     if (!text) return [];
+    // WHY same-text learning: a labelled value and its bare repeat can sit in
+    // one cell/paragraph, so learn from this text too (idempotent, file-wide).
+    // WHY learned-set: _learnPatterns is pure overhead on repeats, so skip
+    // texts already learned via learn() or an earlier spans() call.
+    if (!this._learned.has(text)) {
+      this._learnPatterns(text);
+      this._learned.add(text);
+    }
     // The user's own list wins over everything else.
     const manual = [];
     if (this.manual) {
@@ -484,10 +685,13 @@ export class Redactor {
       (sp) => !manual.some((m) => sp.start < m.end && sp.end > m.start),
     );
     spans.push(...manual);
+    const taken = new Uint8Array(text.length);
+    for (const s of spans) taken.fill(1, s.start, s.end);
+    // WHY after patterns: propagated IDs never steal a labelled span, and the
+    // taken map keeps them from overlapping each other.
+    spans.push(...this._propSpans(text, taken));
     if (!this._compiled) this._compile();
     if (this._compiled.length) {
-      const taken = new Uint8Array(text.length);
-      for (const s of spans) taken.fill(1, s.start, s.end);
       for (const { type, re } of this._compiled) {
         for (const m of text.matchAll(re)) {
           const start = m.index;
@@ -504,8 +708,8 @@ export class Redactor {
           spans.push({ start, end, type, ...this._provForLearned(m[0]) });
         }
       }
-      spans.sort((a, b) => a.start - b.start);
     }
+    spans.sort((a, b) => a.start - b.start);
     return spans;
   }
 

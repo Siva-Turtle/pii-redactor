@@ -83,8 +83,79 @@ function outName(name, ext) {
   return `${base}.redacted.${ext}`;
 }
 
-// Spreadsheet columns whose header says what they hold. The whole column is
-// hidden — cheaper and safer than asking the AI about every cell.
+// Spreadsheet column headers that look like names but describe templates, funds or
+// statement fields. These must never trigger whole-column hiding.
+const NAME_HEADER_BLOCK =
+  /file|sheet|company|bank|scheme|fund|product|plan|branch|city|state|country|nick|user|business|organi[sz]ation|entity|employer|goal|expense|income|asset|liability|liabilities|category|categories|item|head|particular|insurance|loan|investment|transaction|description|type|label/i;
+
+// Template / finance words that sit in a "Name" column but are not people.
+// WHY a set: a header such as "Name" or "Goal Name" hides the whole column,
+// so labels like Self/Spouse/Salary/Total Expenses must veto the hiding.
+export const LABEL_WORDS = new Set([
+  "self", "spouse", "child", "children", "father", "mother", "son", "daughter",
+  "brother", "sister", "husband", "wife", "family", "total", "totals", "pan",
+  "current", "advisor", "adviser", "client", "investor", "customer", "applicant",
+  "holder", "name", "salary", "rent", "utilities", "expense", "expenses", "income",
+  "goal", "goals", "asset", "assets", "liability", "liabilities", "category",
+  "categories", "item", "items", "head", "particular", "particulars", "insurance",
+  "loan", "investment", "investments", "transaction", "transactions", "description",
+  "type", "label", "fund", "scheme", "plan", "branch", "amount", "balance",
+  "quantity", "number", "date", "note", "notes", "period", "statement",
+]);
+// Full-phrase labels (multi-word) that are never names even though each word is capitalised.
+const LABEL_PHRASES = new Set([
+  "fund total",
+  "total expenses",
+  "statement period",
+  "rent & utilities",
+  "rent and utilities",
+  "account holder",
+  "client name",
+  "account holder name",
+]);
+
+// A "Name:" label in one cell with the real name in the cell to its right
+// (key-value layouts). The label itself stays visible; the neighbour is hidden.
+export const NAME_LABEL_RE =
+  /^(?:client|investor|account holder|holder|applicant|customer)?\s*name\s*:?$/i;
+
+/** True when a data cell looks like a person's name: 1-4 capitalised alphabetic words. */
+export function isNameLike(cell) {
+  const text = String(cell ?? "").trim();
+  if (!text) return false;
+  const norm = text.toLowerCase().replace(/\s+/g, " ").replace(/\s*:\s*$/, "");
+  if (LABEL_WORDS.has(norm) || LABEL_PHRASES.has(norm)) return false;
+  if (/[0-9&]/.test(text)) return false;
+  const words = text.split(/\s+/);
+  if (words.length < 1 || words.length > 4) return false;
+  for (const w of words) {
+    if (w.length < 2) return false;
+    if (!/^[A-Za-z][A-Za-z'’-]*$/.test(w)) return false;
+    if (!/^[A-Z]/.test(w)) return false;
+    if (LABEL_WORDS.has(w.toLowerCase())) return false;
+  }
+  return true;
+}
+
+/**
+ * WHY shared: CSV and XLSX must agree on when a NAME column is really people.
+ * Hide the column only when at least half of its non-empty data cells are name-shaped;
+ * otherwise leave the cells to the normal pattern/AI path.
+ */
+export function shouldHideNameColumn(cells) {
+  const vals = (cells || []).map((c) => String(c ?? "").trim()).filter(Boolean);
+  if (!vals.length) return false;
+  const hits = vals.filter(isNameLike).length;
+  return hits / vals.length >= 0.5;
+}
+
+/** Non-empty, non-numeric cells are name candidates for the key-value rule. */
+export function isHidableValue(cell) {
+  const text = String(cell ?? "").trim();
+  if (!text) return false;
+  if (/[0-9]/.test(text)) return false;
+  return true;
+}
 export function headerType(header) {
   const h = String(header ?? "").trim();
   if (!h) return null;
@@ -101,7 +172,7 @@ export function headerType(header) {
     return "ACCOUNT";
   if (
     /name/i.test(h) &&
-    !/file|sheet|company|bank|scheme|fund|product|plan|branch|city|state|country|nick|user|business|organi[sz]ation|entity|employer/i.test(h)
+    !NAME_HEADER_BLOCK.test(h)
   )
     return "NAME";
   return null;
@@ -119,7 +190,12 @@ export function findHeaderRow(rows) {
 }
 
 async function learnWithBudget(redactor, texts, status, warnings) {
-  if (!redactor.detector) return;
+  // WHY still learn without AI: pattern-found IDs (demat/folio/account) must
+  // propagate file-wide even in regex-only mode, so learn() always runs.
+  if (!redactor.detector) {
+    await redactor.learn(texts, {});
+    return;
+  }
   const r = await redactor.learn(texts, {
     maxMs: AI_TIME_BUDGET_MS,
     onProgress: (i, n) => status(`Looking for names and addresses… ${i} of ${n}`),
@@ -173,21 +249,61 @@ async function redactCsv(file, redactor, status) {
   const warnings = [];
   const headRow = findHeaderRow(rows);
   const hidden = (rows[headRow] || []).map(headerType);
+  // WHY prune: a "Name" header over template labels (Self, Salary, Total
+  // Expenses…) is not people. Keep the column only when half the data looks like names.
+  for (let c = 0; c < hidden.length; c++) {
+    if (hidden[c] !== "NAME") continue;
+    const colCells = [];
+    for (let r = headRow + 1; r < rows.length; r++) colCells.push(rows[r][c] ?? "");
+    if (!shouldHideNameColumn(colCells)) hidden[c] = null;
+  }
+  // Key-value layouts: "Name" in one cell, the real name in the cell to its right.
+  // The label stays visible; the neighbour is hidden as NAME.
+  const kvTarget = new Map();
+  const kvLabel = new Set();
+  for (let r = 0; r < rows.length; r++) {
+    const row = rows[r] || [];
+    for (let c = 0; c < row.length; c++) {
+      if (!NAME_LABEL_RE.test(String(row[c] ?? "").trim())) continue;
+      const next = row[c + 1];
+      if (next === undefined || !isHidableValue(next)) continue;
+      if (r === headRow && headerType(next)) continue; // real table header, not key-value
+      kvTarget.set(`${r}:${c + 1}`, String(row[c] ?? "").trim());
+      kvLabel.add(`${r}:${c}`);
+    }
+  }
 
-  const rowText = (row) =>
-    row.filter((cell, c) => !hidden[c] && /\p{L}{3,}/u.test(cell)).join(" | ");
-  await learnWithBudget(redactor, rows.map((row, r) => (r === headRow ? "" : rowText(row))), status, warnings);
+  const rowText = (row, r) =>
+    row.filter((cell, c) => !hidden[c] && !kvTarget.has(`${r}:${c}`) && /\p{L}{3,}/u.test(cell)).join(" | ");
+  await learnWithBudget(redactor, rows.map((row, r) => (r === headRow ? "" : rowText(row, r))), status, warnings);
 
   // Rows above the header are titles: they still go through the patterns/AI.
   const headNames = rows[headRow] || [];
   const out = rows.map((row, r) => {
-    if (r === headRow) return row;
+    if (r === headRow && ![...kvTarget.keys()].some((k) => k.startsWith(`${r}:`))) return row;
     return row.map((cell, c) => {
       const header = headNames[c] ?? "";
       const loc = r > headRow && header
         ? `row ${r + 1}, column "${header}"`
         : `row ${r + 1}, column ${c + 1}`;
-      if (r > headRow && hidden[c]) {
+      if (kvLabel.has(`${r}:${c}`)) return cell; // never hide the "Name" label itself
+      if (kvTarget.has(`${r}:${c}`)) {
+        if (!cell) return cell;
+        const base = redactor.report.length;
+        const outCell = redactor.hideAs("NAME", cell, kvTarget.get(`${r}:${c}`));
+        tagReport(redactor, base, loc);
+        return outCell;
+      }
+      if (r === headRow) return cell; // headers stay readable; only key-value targets above are hidden
+      if (r > headRow && hidden[c] === "NAME") {
+        if (cell && isNameLike(cell)) {
+          const base = redactor.report.length;
+          const outCell = redactor.hideAs(hidden[c], cell, header);
+          tagReport(redactor, base, loc);
+          return outCell;
+        }
+        // Not name-shaped (Self, Salary, Total Expenses…): normal pattern/AI path.
+      } else if (r > headRow && hidden[c]) {
         const base = redactor.report.length;
         const outCell = cell ? redactor.hideAs(hidden[c], cell, header) : cell;
         tagReport(redactor, base, loc);
@@ -246,6 +362,26 @@ async function redactXlsx(file, redactor, status, opts = {}) {
     const headR = range.s.r + findHeaderRow(grid);
     const hidden = {};
     for (let c = range.s.c; c <= range.e.c; c++) hidden[c] = headerType(textAt(headR, c));
+    // WHY prune via the shared helper: a "Name" header over Self/Salary/Total
+    // Expenses… is not people. Same rule as CSV.
+    for (let c = range.s.c; c <= range.e.c; c++) {
+      if (hidden[c] !== "NAME") continue;
+      const colCells = [];
+      for (let r = headR + 1; r <= range.e.r; r++) colCells.push(textAt(r, c));
+      if (!shouldHideNameColumn(colCells)) hidden[c] = null;
+    }
+    // Key-value layouts: "Name" in one cell, the real name to its right.
+    const kvTargets = new Map();
+    const kvLabels = new Set();
+    for (let r = range.s.r; r <= range.e.r; r++) {
+      for (let c = range.s.c; c <= range.e.c; c++) {
+        if (!NAME_LABEL_RE.test(textAt(r, c).trim())) continue;
+        if (c + 1 > range.e.c || !isHidableValue(textAt(r, c + 1))) continue;
+        if (r === headR && headerType(textAt(r, c + 1))) continue; // real table header
+        kvTargets.set(`${r},${c + 1}`, textAt(r, c).trim());
+        kvLabels.add(`${r},${c}`);
+      }
+    }
     for (let r = range.s.r; r <= range.e.r; r++) {
       const rowBits = [];
       for (let c = range.s.c; c <= range.e.c; c++) {
@@ -254,13 +390,31 @@ async function redactXlsx(file, redactor, status, opts = {}) {
         if (!cell) continue;
         const asText = String(cell.w ?? cell.v ?? "");
         const isHeaderRow = r === headR;
+        const key = `${r},${c}`;
+        let cellHidden = r > headR ? hidden[c] : null;
+        let cellHeader = r > headR ? textAt(headR, c) : "";
+        if (kvLabels.has(key)) {
+          cellHidden = null; // never hide the "Name" label itself
+        } else if (kvTargets.has(key)) {
+          cellHidden = "NAME"; // shared helper rule: hide the neighbour as NAME
+          cellHeader = kvTargets.get(key);
+        } else if (cellHidden === "NAME" && !isNameLike(asText)) {
+          cellHidden = null; // template label: leave to the pattern/AI path
+        }
+        // Header-row key-value targets still hide even though headers normally stay.
+        if (isHeaderRow && kvTargets.has(key)) {
+          cellHidden = "NAME";
+          cellHeader = kvTargets.get(key);
+        }
         plan.push({
           cell, asText,
-          hidden: r > headR ? hidden[c] : null,
-          header: r > headR ? textAt(headR, c) : "",
-          sheetName, addr, isHeaderRow,
+          hidden: cellHidden,
+          header: cellHeader,
+          sheetName, addr, isHeaderRow: isHeaderRow && !kvTargets.has(key),
         });
-        if (!isHeaderRow && !(r > headR && hidden[c]) && /\p{L}{3,}/u.test(asText)) rowBits.push(asText);
+        const excluded = kvTargets.has(key) || (r > headR && hidden[c] && hidden[c] !== "NAME") ||
+          (r > headR && hidden[c] === "NAME" && isNameLike(asText));
+        if (!isHeaderRow && !excluded && /\p{L}{3,}/u.test(asText)) rowBits.push(asText);
         if (cell.c) delete cell.c; // cell comments can hold names
         if (cell.l) delete cell.l; // hyperlinks can hold mailto: addresses
       }
