@@ -102,6 +102,9 @@ export const LABEL_WORDS = new Set([
   "loan", "investment", "investments", "transaction", "transactions", "description",
   "type", "label", "fund", "scheme", "plan", "branch", "amount", "balance",
   "quantity", "number", "date", "note", "notes", "period", "statement",
+  // WHY currency never names: a code ("INR", "USD", "Rs") is a unit, so a
+  // cell holding only one is never name-shaped.
+  "inr", "usd", "aed", "eur", "gbp", "sgd", "cad", "aud", "rs",
 ]);
 // Full-phrase labels (multi-word) that are never names even though each word is capitalised.
 const LABEL_PHRASES = new Set([

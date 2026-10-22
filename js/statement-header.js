@@ -6,7 +6,7 @@
 // trusted values with layout regexes (no client-specific words). Trusted
 // values skip the batch agreement check and are searched batch-wide, with
 // name variants and surname widening (see redactor.js).
-import { hasAddressWord, isCommonWord } from "./common-words.js";
+import { hasAddressWord, isCommonWord, isGenericNameTerm, looksLikeLocalityLine } from "./common-words.js";
 
 const NAME_LABEL =
   /^\s*(?:name|investor(?:'s)?\s*name|client\s*name|applicant(?:'s)?\s*name|customer\s*name|sole\s*holder|first\s*holder|second\s*holder|third\s*holder|primary\s*holder|account\s*holder|holder(?:'s)?\s*name|joint\s*holder)\s*[:\-–]\s*(.+?)\s*$/i;
@@ -23,6 +23,15 @@ const CLIENT_LABEL =
 // A line that ends the address continuation (next labelled field or section).
 const STOP_LABEL =
   /^(?:pan|tan|gstin|mob|tel|phone|e-?mail|folio|client|dp|demat|nominee|nomination|date|dob|status|statement|period|summary|certificate|form|assessment|account|a\/c|pin)\b/i;
+// ID-cue words (same generic set as the redactor's ID_CUE_WORDS): a pure
+// number next to one is a labelled ID and stays trusted; without one it is
+// a table amount and must never become trusted.
+const ID_CUE_RE = /\b(?:folio|account|a\/c|acct|client|customer|cust|id|number|no|ref|member|policy|crn|ucc|dp|bo|demat|iban|card|pran|uan)\b/i;
+/** True when the line is a pure number run (digits with spaces/commas/dots only). */
+const isDigitsOnlyLine = (t) => /\d/.test(t) && /^[₹$\s]*\d[\d\s,.]*$/.test(t.trim());
+// Money words (mirrors the redactor's generic money vocabulary): a line
+// carrying one without an ID cue is an amount, never an address.
+const MONEY_HINT_RE = /\b(?:amount|balance|value|price|total|nav|units?|premium|interest|inr|usd|aed|sgd|eur|gbp|rs)\b|\u20B9|\$/i;
 // Email / PAN shapes inside the block (also caught by the pattern layer, but
 // here they become trusted).
 const EMAIL_RE = /[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}/;
@@ -38,6 +47,9 @@ function cleanName(raw) {
   if (!words.some((w) => w.replace(/\./g, "").length >= 2)) return "";
   if (words.length === 1 && isCommonWord(words[0])) return "";
   if (/^(?:self|spouse|child|children|nominee|holder)$/i.test(v)) return "";
+  // WHY shared gate: generic cue/header slips ("Registered", "For", all-lowercase)
+  // must never become trusted names.
+  if (isGenericNameTerm(v)) return "";
   return v;
 }
 
@@ -71,11 +83,28 @@ export function extractHeader(text) {
         push(v, "NAME");
         blockLines.add(i);
         // Address continuation: following address-ish lines until the next
-        // labelled field (up to 4 lines).
+        // labelled field (up to 4 lines). Locality lines without digits
+        // ("Malad (W)") are included; pure place words ("Mumbai") are
+        // skipped over without ending the block; narration lines end it.
+        // WHY amounts stay out: a pure <=7-digit run with no ID cue on this
+        // or the previous line is a table amount, never a trusted address.
         for (let j = i + 1; j < Math.min(lines.length, i + 5); j++) {
           const l2 = lines[j].trim();
           if (!l2 || STOP_LABEL.test(l2) || /:$/.test(l2)) break;
+          if (/\b(?:UPI|NEFT|IMPS|RTGS|NACH|ACH|ECS)\b/i.test(l2)) break;
+          if (isDigitsOnlyLine(l2) && l2.replace(/\D/g, "").length <= 7 &&
+              !ID_CUE_RE.test(`${l2} ${lines[j - 1] || ""}`)) continue;
+          // WHY money lines stay out: "Subscription Amount" is a table label.
+          if (MONEY_HINT_RE.test(l2) && !ID_CUE_RE.test(l2)) continue;
           if (/\d/.test(l2) || hasAddressWord(l2)) {
+            const a = cleanAddressLine(l2);
+            if (a) {
+              push(a, "ADDRESS");
+              blockLines.add(j);
+            }
+          } else if (looksLikeLocalityLine(l2)) {
+            const words = l2.split(/\s+/).map((w) => w.replace(/[^A-Za-z]/g, "")).filter(Boolean);
+            if (words.length && words.every(isCommonWord)) continue;
             const a = cleanAddressLine(l2);
             if (a) {
               push(a, "ADDRESS");

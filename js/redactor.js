@@ -17,7 +17,7 @@
 // "column" (whole spreadsheet/CSV column hidden by its header).
 
 import { NOT_A_SECRET, applySpans, findPatternSpans, labelFor } from "./patterns.js";
-import { hasAddressWord, isCommonWord } from "./common-words.js";
+import { hasAddressWord, isCommonWord, isGenericNameTerm, looksLikeLocalityLine } from "./common-words.js";
 import { extractHeader } from "./statement-header.js";
 // (Address vocabulary lives in common-words.js ADDRESS_WORDS.)
 
@@ -184,6 +184,8 @@ export function isDigitsOnlyText(s) {
 export function isFilteredModelHit(hit, kind, working) {
   const n = normHit(hit);
   if (!n) return true;
+  // WHY currency first: a code alone ("INR", "Rs", "₹") is a unit, never PII.
+  if (isCurrencyCode(hit)) return true;
   if (GENERIC_MODEL_WORDS.has(n)) return true;
   if (n.endsWith("s") && GENERIC_MODEL_WORDS.has(n.slice(0, -1))) return true;
   if (ROLE_RE.test(n)) return true;
@@ -202,10 +204,18 @@ export function isFilteredModelHit(hit, kind, working) {
   if (/^[\d\s]*$/.test(n) && digits.length > 0 && digits.length <= 6) return true;
   // Digits-only (7+ digits, separators at most space/dot/slash/dash): kept
   // only with an ID cue and no money word nearby (the model marks amounts).
+  // WHY 8+ digit carve-out: a bare number-only run (digits and spaces only,
+  // no currency, commas or decimals) is an ID/policy number, not an amount,
+  // so it stays hidable for ID/ACCOUNT even without a same-line cue unless
+  // a money word sits next to it (the amount guard still owns those).
   if (/^\d[\d\s./-]*$/.test(n)) {
     const { label, header } = labelAndHeader(working || "", hit);
     const cue = `${label || ""} ${header || ""}`;
-    if (!(hasIdWord(cue) && !hasMoneyWord(cue))) return true;
+    if (!(hasIdWord(cue) && !hasMoneyWord(cue))) {
+      const pureDigits = n.replace(/\D/g, "");
+      const plainRun = /^[\d\s]*$/.test(n) && pureDigits.length >= 8;
+      if (!(plainRun && (kind === "ID" || kind === "ACCOUNT") && !hasMoneyWord(cue))) return true;
+    }
   }
   return false;
 }
@@ -244,10 +254,230 @@ export function cleanHit(hit) {
 
 // Amounts, currency values and percentages are never PII; the 9+ digit carve-out
 // keeps long digit strings (account-like) eligible for the ID path below.
-const MONEY = /^[\s(\-+]*(?:(?:US|A|C|S|HK)?\$|USD|INR|Rs\.?|₹|€|£|¥)?\s*[\d,]+(?:\.\d+)?\s*(?:%|USD|INR|CR|DR|cr|dr|[KMB]n?)?[\s)]*$/;
+const MONEY = /^[\s(\-+]*(?:(?:US|A|C|S|HK)?\$|USD|INR|AED|EUR|GBP|SGD|CAD|AUD|Rs\.?|₹|€|£|¥)?\s*[\d,]+(?:\.\d+)?\s*(?:%|USD|INR|AED|EUR|GBP|CR|DR|cr|dr|[KMB]n?)?[\s)]*$/;
 const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 const wsRe = (s) => escapeRe(s).replace(/\s+/g, "\\s+");
 const normKey = (s) => s.replace(/\s+/g, " ").trim().toLowerCase();
+
+// Lone role qualifiers: a single such word is a label, never a name
+// ("Service", "Asset"). Generic, no document-specific words.
+const ROLE_QUALIFIERS = new Set(
+  ["investment", "insurance", "relationship", "service", "asset", "branch", "wealth", "account", "principal"],
+);
+// Currency codes/symbols marking an amount (never PII when paired with digits).
+const CURRENCY_RE = /(?:AED|USD|INR|EUR|GBP|SGD|CAD|AUD|Rs\.?|₹|\$|€|£|¥)/i;
+// Currency codes/symbols as standalone tokens. Bounded so names containing
+// the same letters ("Ursula") still pass. A code is never a name or an ID
+// on its own, and never part of a person/address name ("Market Value (INR)"
+// is a header label, not a person).
+const CURRENCY_TOKEN_RE = /\b(?:AED|USD|INR|EUR|GBP|SGD|CAD|AUD|Rs\.?)\b|[₹$€£¥]/i;
+/** True when the whole string is one currency code/symbol ("INR", "Rs", "₹"). Exported for tests. */
+export function isCurrencyCode(s) {
+  const t = String(s || "").trim().replace(/^[([{]+|[)\]}.,;:]+$/g, "").trim();
+  return /^(?:AED|USD|INR|EUR|GBP|SGD|CAD|AUD|Rs\.?|₹|\$|€|£|¥)$/i.test(t);
+}
+
+/**
+ * Shared gate for every newline-split model piece. True = the piece may be
+ * learned or emitted; false = drop it (never merge into neighbours).
+ * WHY one helper: _learnGliner and spans() must apply exactly the same gates
+ * as a whole hit (isFilteredModelHit with the piece's own kind, amount
+ * guard, isCommonWord/isGenericNameTerm for NAME, min-length), or a piece
+ * like "AED 0.00", "118160", "Service" or "Manager" leaks everywhere.
+ * `working` is the window/context for cue checks; when `text/start/end` are
+ * given the offset-aware amount guard (isAmountVisible) also applies.
+ * Exported for tests.
+ */
+export function passesModelPieceGate(piece, kind, working, text = null, start = null, end = null) {
+  const rawInput = String(piece || "").replace(/\s+/g, " ").trim();
+  if (!rawInput) return false;
+  let hit = rawInput;
+  try {
+    hit = cleanHit(rawInput);
+  } catch {
+    hit = rawInput;
+  }
+  if (!hit || hit.length < 2 || hit.length > 140) return false;
+  // WHY currency first: a code alone ("INR", "Rs", "₹") is a unit, never PII,
+  // whatever the model called it.
+  if (isCurrencyCode(hit)) return false;
+  let genericCheck = hit;
+  if (kind === "NAME" || kind === "ADDRESS") {
+    // WHY currency never names: a header label ("Market Value (INR)") the
+    // model calls a person/address must not learn or emit.
+    if (CURRENCY_TOKEN_RE.test(hit)) return false;
+  }
+  if (kind === "NAME") {
+    // WHY grounded spelling: the model may return lowercase ("zed quux")
+    // while the document holds capitals ("Zed Quux"); judge genericness on
+    // the document's own spelling so real names still learn.
+    genericCheck = hit;
+    try {
+      const gm = new RegExp(wsRe(hit), "i").exec(working || "");
+      if (gm && gm[0]) genericCheck = gm[0].replace(/\s+/g, " ").trim();
+    } catch {
+      genericCheck = hit;
+    }
+    // WHY shared gate: generic cue/header slips must never spread.
+    if (isGenericNameTerm(genericCheck)) return false;
+    const words = hit.split(/\s+/).filter(Boolean);
+    if (words.length === 1) {
+      const w = words[0].replace(/[^A-Za-z]/g, "");
+      if (w) {
+        if (isCommonWord(w)) return false;
+        if (hasIdWord(w)) return false;
+        if (hasMoneyWord(w)) return false;
+        if (ROLE_QUALIFIERS.has(w.toLowerCase())) return false;
+        if (hasAddressWord(w)) return false;
+      }
+    } else if (words.length > 1) {
+      // Multi-word label fragments ("Service Number"): every token a
+      // qualifier/cue/money/address/common word is a label, not a person.
+      const isLabelToken = (w) => {
+        const c = String(w || "").replace(/[^A-Za-z]/g, "");
+        if (!c) return true;
+        if (isCommonWord(c)) return true;
+        if (hasIdWord(c)) return true;
+        if (hasMoneyWord(c)) return true;
+        if (ROLE_QUALIFIERS.has(c.toLowerCase())) return true;
+        if (hasAddressWord(c)) return true;
+        return false;
+      };
+      if (words.every(isLabelToken)) return false;
+    }
+  }
+  const isValueKind = kind === "EMAIL" || kind === "ACCOUNT" || kind === "ID" || kind === "SECRET" || kind === "PAN" || kind === "FOLIO" || kind === "PHONE";
+  const hasOffsets = text != null && start != null && end != null;
+  try {
+    if (isFilteredModelHit(hit, kind, working || "")) {
+      // WHY emit-path override: stripped value pieces ("55-123-77") lose
+      // their label prefix, so the step-2 digits-only rule (ID cue without
+      // any money word) misfires when a distant money word like "tax" sits
+      // in the 40-char window. For already-learned values the offset-aware
+      // amount guard decides; an ID-cued value stays hidable.
+      if (hasOffsets && isValueKind) {
+        let idCued = false;
+        try {
+          const ctx = labelAndHeaderAt(String(text || ""), start, end);
+          idCued = hasIdWord(`${ctx.label || ""} ${ctx.header || ""}`);
+        } catch {
+          idCued = false;
+        }
+        if (!(idCued && !(/\d/.test(hit) && CURRENCY_RE.test(hit)))) return false;
+        // ID-cued: fall through to the currency/amount/min-length checks below.
+      } else if (hasOffsets && kind === "NAME") {
+        // WHY token exception: step-2 short rule blocks any 1-4 letter word,
+        // but tokenization deliberately keeps 4-letter capitalised surnames
+        // ("Quux"); a 4-letter capitalised piece that is otherwise clean
+        // stays hidable, shorter/lowercase pieces stay blocked.
+        const lettersOnly = hit.replace(/[^A-Za-z]/g, "");
+        const groundedHasUpper = /[A-Z]/.test(genericCheck);
+        if (!(groundedHasUpper && lettersOnly.length === 4)) return false;
+        try {
+          if (isFilteredModelHit(`${hit}zzzzz`, kind, working || "")) return false;
+        } catch {
+          return false;
+        }
+        // Short was the sole reason: fall through (token stays).
+      } else {
+        return false;
+      }
+    }
+  } catch {
+    return false;
+  }
+  // WHY same MONEY rule as _acceptSingle: currency/decimal/comma amounts stay.
+  const digitsOnlyRun = /^\d[\d\s]*$/.test(hit);
+  try {
+    if (!digitsOnlyRun && MONEY.test(hit) && !/^\d{9,}$/.test(hit.replace(/[\s,]/g, ""))) return false;
+  } catch {
+    /* a bad hit must never break the gate */
+  }
+  // Currency + digits is always an amount (AED 0.00, Rs. 1,181,600,
+  // INR 85,000 / USD 750 stay visible even when ID-cued).
+  if (/\d/.test(hit) && CURRENCY_RE.test(hit)) return false;
+  // Slash-joined numbers with a money cue are one amount, not an ID.
+  if (/\d.*\/.*\d/.test(hit)) {
+    try {
+      if (hasMoneyWord(hit) || hasMoneyWord(working || "") || CURRENCY_RE.test(hit) || /[,.]/.test(hit)) return false;
+    } catch {
+      return false;
+    }
+  }
+  // Offset-aware amount guard for the emit path (digits-only spans that read
+  // as amounts stay visible).
+  if (text != null && start != null && end != null && isDigitsOnlyText(hit)) {
+    try {
+      if (isAmountVisible(text, start, end)) return false;
+    } catch {
+      return false;
+    }
+  }
+  // Minimum-length rules for value kinds (same as _acceptSingle).
+  if (kind === "EMAIL") {
+    if (!/@/.test(hit) || hit.length < 5) return false;
+  } else if (kind === "ACCOUNT" || kind === "ID" || kind === "SECRET" || kind === "PAN" || kind === "FOLIO" || kind === "PHONE") {
+    if (kind !== "SECRET" && (!/\d/.test(hit) || hit.length < 5)) return false;
+    if (kind === "SECRET" && hit.length < 4) return false;
+  }
+  return true;
+}
+
+/**
+ * Amount ranges inside [start, end) that must stay visible even when a
+ * span-union would swallow them. Currency amounts, comma/decimals and
+ * digits-only spans the amount guard keeps visible are all excluded.
+ * Returns merged [s, e] pairs. Exported for tests.
+ */
+export function findAmountExclusions(text, start, end) {
+  const out = [];
+  const t = String(text || "");
+  if (!(end > start) || start < 0 || end > t.length) return out;
+  const push = (s, e) => {
+    if (e > s && s < end && e > start) out.push([Math.max(s, start), Math.min(e, end)]);
+  };
+  try {
+    const curRe = /(?:AED|USD|INR|EUR|GBP|SGD|CAD|AUD|Rs\.?|₹|\$|€|£|¥)\s*\d[\d,]*\.?\d*/gi;
+    for (const m of t.slice(start, end).matchAll(curRe)) push(start + m.index, start + m.index + m[0].length);
+    // WHY lone codes: a bare currency code ("INR", "Rs", "₹") is a unit,
+    // never PII, so a span-union must split around it instead of swallowing it.
+    const loneRe = /(?<![A-Za-z])(?:AED|USD|INR|EUR|GBP|SGD|CAD|AUD|Rs\.?)(?![A-Za-z])|[₹$€£¥]/g;
+    for (const m of t.slice(start, end).matchAll(loneRe)) push(start + m.index, start + m.index + m[0].length);
+    // Slash-joined amounts with currency or formatting (folio "12345678/45"
+    // has neither, so it still hides).
+    const slashRe = /\d[\d,]*\.?\d*\s*\/\s*\d[\d,]*\.?\d*/g;
+    for (const m of t.slice(start, end).matchAll(slashRe)) {
+      const seg = m[0];
+      if (CURRENCY_RE.test(seg) || /[,.]/.test(seg)) push(start + m.index, start + m.index + seg.length);
+    }
+    const commaRe = /\b\d{1,3}(?:,\d{2,3})+(?:\.\d+)?\b/g;
+    for (const m of t.slice(start, end).matchAll(commaRe)) push(start + m.index, start + m.index + m[0].length);
+    const decRe = /\b\d+\.\d+\b/g;
+    for (const m of t.slice(start, end).matchAll(decRe)) push(start + m.index, start + m.index + m[0].length);
+    const numRe = /(?<!\d)\d[\d\s,.]*(?!\d)/g;
+    for (const m of t.slice(start, end).matchAll(numRe)) {
+      const s = start + m.index, e = s + m[0].length;
+      const raw = t.slice(s, e);
+      if (!isDigitsOnlyText(raw)) continue;
+      try {
+        if (isAmountVisible(t, s, e)) push(s, e);
+      } catch {
+        /* never break merging on a bad slice */
+      }
+    }
+  } catch {
+    return [];
+  }
+  if (!out.length) return out;
+  out.sort((a, b) => a[0] - b[0]);
+  const merged = [out[0]];
+  for (let i = 1; i < out.length; i++) {
+    const last = merged[merged.length - 1];
+    if (out[i][0] <= last[1]) last[1] = Math.max(last[1], out[i][1]);
+    else merged.push(out[i]);
+  }
+  return merged;
+}
 
 // Pattern-found identifiers that must hide everywhere, even without their
 // label: a DEMAT/FOLIO/ACCOUNT/ID value seen once with its label is
@@ -480,9 +710,24 @@ export function computeGlobals(batchTexts, quotes) {
   const out = [];
   for (const f of flags.values()) {
     if (f.text.length < 4) continue;
+    // WHY currency never spreads: a code alone is a unit, and a name
+    // carrying one ("Market Value (INR)") is a header label, not a person.
+    if (isCurrencyCode(f.text)) continue;
+    if (f.type === "NAME" && CURRENCY_TOKEN_RE.test(f.text)) continue;
+    // WHY shared gate: a generic cue/header slip must never become batch-wide.
+    if (f.type === "NAME" && isGenericNameTerm(f.text)) continue;
     const digitsOnly = /^\d+$/.test(f.text.replace(/\s+/g, ""));
     if (digitsOnly && f.text.replace(/\D/g, "").length < 6) continue;
+    // WHY plain numbers stay local: a pure <=7-digit run the model quoted
+    // with no ID label is a table amount, not an ID; pattern-found values
+    // (script rule), trusted header values and address parts still go on.
+    if (digitsOnly && f.text.replace(/\D/g, "").length <= 7) {
+      const src = f.prov?.source;
+      if ((src === "gliner" || src === "needle" || src === "global") && !f.prov?.trusted) continue;
+    }
     if (f.prov?.trusted) {
+      // Trusted header values skip agreement but never skip the generic gate.
+      if (f.type === "NAME" && isGenericNameTerm(f.text)) continue;
       out.push({ text: f.text, type: f.type, prov: f.prov });
       continue;
     }
@@ -713,6 +958,16 @@ export class Redactor {
   addGlobal(text, type, prov) {
     const t = String(text || "").replace(/\s+/g, " ").trim();
     if (!t) return;
+    // WHY shared gate: a bad term must never become batch-wide.
+    if (type === "NAME" && isGenericNameTerm(t)) return;
+    if (isCurrencyCode(t)) return;
+    if (type === "NAME" && CURRENCY_TOKEN_RE.test(t)) return;
+    // WHY plain numbers stay local: a pure <=7-digit model quote with no ID
+    // label is a table amount; script/trusted/filename IDs still go on.
+    if (/^\d+$/.test(t.replace(/\s+/g, "")) && t.replace(/\D/g, "").length <= 7) {
+      const src = prov?.source;
+      if ((src === "gliner" || src === "needle" || src === "global") && !prov?.trusted) return;
+    }
     const stored = { source: "global", via: prov || {}, type };
     this.globals.push({ text: t, type, prov: stored, digitOnly: /^\d+$/.test(t.replace(/\s+/g, "")) });
     this._globalRe = null;
@@ -862,14 +1117,23 @@ export class Redactor {
         for (const e of ents) {
           const kind = GLINER_LABEL_KIND[e.label];
           if (!kind || (e.score ?? 0) < GLINER_MIN) continue;
-          const raw = String(e.word || "").replace(/\s+/g, " ").trim();
-          if (!raw) continue;
-          // WHY shared helper here as well as in _accept: the GLiNER window is
-          // available at this point, so product names skip before grounding;
-          // _accept repeats the check on its working text for the older path.
-          if (kind === "NAME" && isFundAdjacent(raw, w)) continue;
-          const found = this._accept(raw, kind, w.replace(/\n/g, " "));
-          if (found) this._addTerm(found.term, found.kind, { source: "gliner", label: e.label, score: +Number(e.score || 0).toFixed(2) });
+          // WHY split at newline: a model hit crossing lines ("NAME\nB2203")
+          // must never become one term matching across the line break; each
+          // line part passes the same gates as a whole hit, failures are
+          // dropped (never merged into neighbours).
+          for (const piece of String(e.word || "").split("\n")) {
+            const raw = piece.replace(/\s+/g, " ").trim();
+            if (!raw) continue;
+            // WHY shared gate first: amounts ("AED 0.00") and generic words
+            // ("Service", "Manager", "Registered") never reach _accept.
+            if (!passesModelPieceGate(raw, kind, w.replace(/\n/g, " "))) continue;
+            // WHY shared helper here as well as in _accept: the GLiNER window is
+            // available at this point, so product names skip before grounding;
+            // _accept repeats the check on its working text for the older path.
+            if (kind === "NAME" && isFundAdjacent(raw, w)) continue;
+            const found = this._accept(raw, kind, w.replace(/\n/g, " "));
+            if (found) this._addTerm(found.term, found.kind, { source: "gliner", label: e.label, score: +Number(e.score || 0).toFixed(2) });
+          }
         }
         onProgress?.(++done, total);
       }
@@ -915,10 +1179,13 @@ export class Redactor {
       return;
     }
     for (const h of found) {
+      // WHY shared gate: a generic header value must never become trusted.
+      if (h.type === "NAME" && isGenericNameTerm(h.value)) continue;
       const key = normKey(h.value);
       if (!this.trusted.has(key)) this.trusted.set(key, { text: h.value, type: h.type, variant: false });
       if (h.type === "NAME") {
         for (const v of nameVariants(h.value)) {
+          if (isGenericNameTerm(v)) continue;
           const k = normKey(v);
           if (!this.trusted.has(k)) this.trusted.set(k, { text: v, type: "NAME", variant: true });
         }
@@ -972,24 +1239,70 @@ export class Redactor {
   // --- Step 8: address blocks. A line that equals a trusted full name
   // (whitespace/case-insensitive) is itself fully hidden, so it opens a
   // block: up to 4 following lines hide while each holds an address word or
-  // a digit. Stops at an empty line, a labelled/section line, or a line
-  // ending with ":". Learned as trusted so it works in every format.
+  // a digit. A salutation-name heading ("MR. ROHAN AMIT KULKARNI") also
+  // opens a block even with no label. Locality lines ("Malad (W)") hide;
+  // pure place words ("Mumbai") are skipped over; narration lines end it.
+  // Stops at an empty line, a labelled/section line, or a line ending with
+  // ":". Learned as trusted so it works in every format.
   _learnAddressBlocks(text) {
-    if (!text || !this.trusted.size) return;
+    if (!text) return;
+    const lines = text.split("\n");
+    // Salutation-name headings open blocks even with no prior trusted name.
+    const SAL_RE = /^\s*(?:mr|mrs|ms|miss|dr|shri|smt|sri|prof)\.?\s*(.+?)\s*$/i;
+    for (let i = 0; i < lines.length; i++) {
+      const mm = lines[i].match(SAL_RE);
+      if (!mm) continue;
+      const cand = mm[1].replace(/\./g, " ").replace(/\s+/g, " ").trim();
+      const parts = cand.split(" ").filter(Boolean);
+      if (parts.length < 2 || parts.length > 4) continue;
+      if (parts.some((p) => p.replace(/[^A-Za-z]/g, "").length < 2)) continue;
+      if (isGenericNameTerm(cand)) continue;
+      const key = normKey(cand);
+      if (!this.trusted.has(key)) this.trusted.set(key, { text: cand, type: "NAME", variant: false });
+      for (const v of nameVariants(cand)) {
+        if (isGenericNameTerm(v)) continue;
+        const k = normKey(v);
+        if (!this.trusted.has(k)) this.trusted.set(k, { text: v, type: "NAME", variant: true });
+      }
+    }
+    if (!this.trusted.size) return;
     const names = new Set(
       [...this.trusted.values()].filter((v) => v.type === "NAME").map((v) => normKey(v.text)),
     );
     if (!names.size) return;
-    const lines = text.split("\n");
+    const strippedKey = (line) => {
+      const mm = line.match(SAL_RE);
+      const base = mm ? mm[1].replace(/\./g, " ").replace(/\s+/g, " ").trim() : line;
+      return normKey(base);
+    };
     for (let i = 0; i < lines.length; i++) {
-      if (!names.has(normKey(lines[i]))) continue;
+      if (!names.has(normKey(lines[i])) && !names.has(strippedKey(lines[i]))) continue;
       for (let j = i + 1; j < Math.min(lines.length, i + 5); j++) {
         const t = lines[j].trim();
         if (!t) break;
         if (/^(?:pan|tan|status|gstin|mob|tel|phone|e-?mail|dear|subject|your|this|date|name|form|assessment|period|summary|certificate|statement|page|sr|s\.no)\b/i.test(t) || /:$/.test(t)) break;
-        if (!(hasAddressWord(t) || /\d/.test(t))) break;
-        const key = normKey(t);
-        if (!this.trusted.has(key)) this.trusted.set(key, { text: t, type: "ADDRESS" });
+        if (/\b(?:UPI|NEFT|IMPS|RTGS|NACH|ACH|ECS)\b/i.test(t)) break;
+        // WHY amounts stay visible: a pure <=7-digit run with no ID cue on
+        // this or the previous line is a table amount, not an address; a
+        // lone currency code is a unit; a money line without an ID cue is
+        // an amount. Skipped (never trusted) but the block stays open.
+        if (isCurrencyCode(t)) continue;
+        if (isDigitsOnlyText(t) && t.replace(/\D/g, "").length <= 7) {
+          if (!hasIdWord(`${t} ${lines[j - 1] || ""}`)) continue;
+        } else if (hasMoneyWord(t) && !hasIdWord(t)) continue;
+        if (hasAddressWord(t) || /\d/.test(t)) {
+          const key = normKey(t);
+          if (!this.trusted.has(key)) this.trusted.set(key, { text: t, type: "ADDRESS" });
+          continue;
+        }
+        if (looksLikeLocalityLine(t)) {
+          const words = t.split(/\s+/).map((w) => w.replace(/[^A-Za-z]/g, "")).filter(Boolean);
+          if (words.length && words.every(isCommonWord)) continue;
+          const key = normKey(t);
+          if (!this.trusted.has(key)) this.trusted.set(key, { text: t, type: "ADDRESS" });
+          continue;
+        }
+        break;
       }
     }
   }
@@ -1099,7 +1412,9 @@ export class Redactor {
   // --- Step 8: PIN. A 6-digit number at the end of a line (trailing
   // letters/punctuation allowed) hides when the line has no tab, holds 3+
   // letters before it, and ≥40% of the non-space text before it is already
-  // hidden (an address line). Tab lines are table rows, not PINs.
+  // hidden (an address line). A PIN after a PIN/PINCODE/Pin Code label, or
+  // after "<word>-" at the end of an address line, hides as ADDRESS outright
+  // (no hidden context needed). Tab lines are table rows, not PINs.
   _pinSpans(text, taken) {
     const out = [];
     let off = 0;
@@ -1112,6 +1427,25 @@ export class Redactor {
       const m = runs[runs.length - 1]; // the number at the end of the line
       if (!/^[A-Za-z.,;:!?'"()\s]*$/.test(line.slice(m.index + 6))) continue;
       const before = line.slice(0, m.index);
+      // WHY label/hyphen PINs hide outright: "PINCODE: 400064" and
+      // "Mumbai,Maharashtra-400064" are address PII even when the address
+      // line itself was never hidden (out-of-range block, no trusted name).
+      const pinLabelled = /(?:\bpin\s*code\b|\bpincode\b|\bpin\b)\s*[:\-–]?\s*$/i.test(before);
+      const hyphenAddr = /[A-Za-z]-\s*$/.test(before) && (hasAddressWord(line) || /,/.test(line));
+      if (pinLabelled || hyphenAddr) {
+        const start = lineStart + m.index, end = start + 6;
+        let free = true;
+        for (let i = start; i < end; i++) {
+          if (taken[i]) {
+            free = false;
+            break;
+          }
+        }
+        if (!free) continue;
+        taken.fill(1, start, end);
+        out.push({ start, end, type: "ADDRESS", source: "script", rule: "PIN" });
+        continue;
+      }
       if ((before.match(/[A-Za-z]/g) || []).length < 3) continue;
       let hidden = 0, total = 0;
       for (let i = 0; i < before.length; i++) {
@@ -1135,14 +1469,112 @@ export class Redactor {
     return out;
   }
 
+  // --- Step 8: postal codes inside address lines. A 5-digit run touching a
+  // comma/hyphen on an address-ish line (address word present) hides as
+  // ADDRESS (e.g. ",22334", "-22334-"). Keeps standalone 5-digit amounts
+  // visible: the comma/hyphen touch plus an address word are both required.
+  _postalSpans(text, taken) {
+    const out = [];
+    let off = 0;
+    for (const line of text.split("\n")) {
+      const lineStart = off;
+      off += line.length + 1;
+      if (!line || line.includes("\t")) continue;
+      if (!hasAddressWord(line)) continue;
+      for (const m of line.matchAll(/(?<!\d)\d{5}(?!\d)/g)) {
+        const before = m.index > 0 ? line[m.index - 1] : "";
+        const after = m.index + 5 < line.length ? line[m.index + 5] : "";
+        if (before !== "," && before !== "-" && before !== "–" && before !== "—" &&
+            after !== "," && after !== "-" && after !== "–" && after !== "—") continue;
+        const start = lineStart + m.index, end = start + 5;
+        let free = true;
+        for (let i = start; i < end; i++) {
+          if (taken[i]) {
+            free = false;
+            break;
+          }
+        }
+        if (!free) continue;
+        taken.fill(1, start, end);
+        out.push({ start, end, type: "ADDRESS", source: "script", rule: "postal", trusted: true });
+      }
+    }
+    return out;
+  }
+
   // --- Step 8: bank narrations. On lines holding UPI/NEFT/IMPS/RTGS/NACH/ACH/
   // ECS, a 4+ letter token between / - : delimiters that is a proper prefix
   // of a trusted name word (narrations cut names to a fixed width) hides.
+  // Plus the payee segment right after "UPI/" hides as NAME (amounts stay).
   _narrationSpans(text, taken) {
     const out = [];
+    const push = (start, end) => {
+      for (let i = start; i < end; i++) if (taken[i]) return false;
+      taken.fill(1, start, end);
+      out.push({ start, end, type: "NAME", source: "script", rule: "narration", trusted: true });
+      return true;
+    };
+    let off = 0;
+    // Name words grounding the payee segment (trusted + cue-learned, 4+
+    // letters, not common). WHY grounded: "CUST" must stay while "ROHAN KU"
+    // hides; the segment must share a word/prefix with a known name.
+    const nameWords = (() => {
+      const seen = new Set();
+      const outW = [];
+      const add = (s) => {
+        for (const w of String(s || "").split(/\s+/)) {
+          const c = w.replace(/[^A-Za-z]/g, "");
+          const k = c.toLowerCase();
+          if (c.length >= 4 && !isCommonWord(c) && !seen.has(k)) {
+            seen.add(k);
+            outW.push(c);
+          }
+        }
+      };
+      for (const v of this.trusted.values()) if (v.type === "NAME") add(v.text);
+      for (const t of this.terms.NAME) add(t);
+      return outW;
+    })();
+    for (const line of text.split("\n")) {
+      const lineStart = off;
+      off += line.length + 1;
+      if (!/\b(?:UPI|NEFT|IMPS|RTGS|NACH|ACH|ECS)\b/.test(line)) continue;
+      // Payee segment between "UPI/" and the next "/": hide when it looks
+      // like a name and shares a word/prefix with a known name. Amounts
+      // ("12345") contain digits and stay visible; "CUST"/"Some Bank" share
+      // nothing and stay.
+      try {
+        for (const m of line.matchAll(/UPI\/([^/]+?)\//gi)) {
+          const seg = m[1];
+          if (!seg) continue;
+          const t = seg.trim();
+          if (t.length < 2 || !/[A-Za-z]/.test(t)) continue;
+          if (/\d/.test(t) || /@/.test(t)) continue;
+          if (CORPORATE.test(t)) continue;
+          const words = t.split(/\s+/).map((w) => w.replace(/[^A-Za-z]/g, "")).filter(Boolean);
+          if (!words.length) continue;
+          if (words.every(isCommonWord)) continue;
+          if (!nameWords.length) continue;
+          const grounded = words.some((w) => {
+            if (w.length < 2) return false;
+            const low = w.toLowerCase();
+            return nameWords.some((nw) => {
+              const nl = nw.toLowerCase();
+              return nl === low || (low.length >= 3 && nl.startsWith(low)) || (nl.length >= 3 && low.startsWith(nl));
+            });
+          });
+          if (!grounded) continue;
+          const at = m[0].indexOf(seg);
+          if (at < 0) continue;
+          push(lineStart + m.index + at, lineStart + m.index + at + seg.length);
+        }
+      } catch {
+        /* a bad narration line must never break redaction */
+      }
+    }
     const words = this._trustedNameWords();
     if (!words.length) return out;
-    let off = 0;
+    off = 0;
     for (const line of text.split("\n")) {
       const lineStart = off;
       off += line.length + 1;
@@ -1169,6 +1601,60 @@ export class Redactor {
         taken.fill(1, start, end);
         out.push({ start, end, type: "NAME", source: "script", rule: "narration", trusted: true });
       }
+    }
+    return out;
+  }
+
+  // --- Step 8: concatenated name parts. A bare token that equals learned
+  // name parts joined together ("rohankulkarni" for "Rohan ... Kulkarni",
+  // first+last when 3+ parts) or a >=10-char prefix of one hides as NAME
+  // (narrations/refs drop the spaces, sometimes truncating the tail).
+  _concatSpans(text, taken) {
+    const out = [];
+    const cands = new Set();
+    const addName = (nameStr) => {
+      const parts = String(nameStr || "")
+        .split(/\s+/)
+        .map((w) => w.replace(/[^A-Za-z]/g, ""))
+        .filter((w) => w.length >= 2);
+      if (parts.length < 2 || parts.length > 4) return;
+      if (parts.every((p) => isCommonWord(p))) return;
+      const full = parts.join("").toLowerCase();
+      if (full.length >= 5) cands.add(full);
+      if (parts.length >= 3) {
+        const fl = (parts[0] + parts[parts.length - 1]).toLowerCase();
+        if (fl.length >= 5) cands.add(fl);
+      }
+    };
+    for (const v of this.trusted.values()) if (v.type === "NAME") addName(v.text);
+    for (const t of this.terms.NAME) addName(t);
+    if (!cands.size) return out;
+    const list = [...cands];
+    for (const m of String(text || "").matchAll(/[A-Za-z]{5,}/g)) {
+      const low = m[0].toLowerCase();
+      let hit = false;
+      for (const c of list) {
+        if (low === c) {
+          hit = true;
+          break;
+        }
+        if (low.length >= 10 && c.startsWith(low) && c.length > low.length) {
+          hit = true;
+          break;
+        }
+      }
+      if (!hit) continue;
+      const start = m.index, end = start + m[0].length;
+      let free = true;
+      for (let i = start; i < end; i++) {
+        if (taken[i]) {
+          free = false;
+          break;
+        }
+      }
+      if (!free) continue;
+      taken.fill(1, start, end);
+      out.push({ start, end, type: "NAME", source: "script", rule: "concat", trusted: true });
     }
     return out;
   }
@@ -1328,6 +1814,9 @@ export class Redactor {
 
   _acceptSingle(raw, kind, working) {
     let hit = cleanHit(raw);
+    // WHY shared gate: newline pieces and whole hits pass the same filters;
+    // amounts (AED 0.00, INR 85,000 / USD 750) and generic words never learn.
+    if (!passesModelPieceGate(hit, kind, working)) return null;
     // Step-2 model-hit filter: generic labels, roles, short words, ISINs,
     // dates, amounts and uncued digit runs are never PII.
     if (isFilteredModelHit(hit, kind, working)) return null;
@@ -1395,6 +1884,12 @@ export class Redactor {
   _addTerm(raw, kind, prov = null) {
     const term = raw.replace(/\s+/g, " ").trim();
     if (term.length < 2 || term.length > 140) return;
+    // WHY currency never learns: a code alone is a unit, and a name
+    // carrying one is a header label, not a person.
+    if (isCurrencyCode(term)) return;
+    if ((kind === "NAME" || kind === "ADDRESS") && CURRENCY_TOKEN_RE.test(term)) return;
+    // WHY shared gate: every cue/label/model NAME funnels through here.
+    if (kind === "NAME" && !/\d/.test(term) && isGenericNameTerm(term)) return;
     const key = normKey(term);
     if (kind === "NAME" && !/\d/.test(term)) {
       if (prov && !this.termProv.has(key)) this.termProv.set(key, prov);
@@ -1478,18 +1973,85 @@ export class Redactor {
     spans.push(...manual);
     const taken = new Uint8Array(text.length);
     for (const s of spans) taken.fill(1, s.start, s.end);
-    // WHY after patterns: propagated IDs never steal a labelled span, and the
-    // taken map keeps them from overlapping each other.
-    spans.push(...this._propSpans(text, taken));
+    // WHY union merge: overlapping spans (trusted ADDRESS vs pattern IDs,
+    // learned NAME vs address lines) must hide the whole union, not drop one
+    // side and leak the rest (",NORTH THIRD," stayed visible). Highest-priority
+    // type wins the label (ADDRESS for address parts); a trusted part keeps
+    // the union trusted so the amount guard still bypasses it.
+    const rank = (t) => {
+      if (t === "CUSTOM") return -1;
+      if (t === "PIN") return 0;
+      const i = KINDS.indexOf(t);
+      return i < 0 ? 99 : i;
+    };
+    const addMerged = (ns) => {
+      const overlapping = spans.filter((s) => ns.start < s.end && ns.end > s.start);
+      if (!overlapping.length) {
+        // WHY amount split even without overlap: a single span swallowing an
+        // amount (currency/decimal/comma or amount-visible digits) must keep
+        // the amount out.
+        const soloGaps = findAmountExclusions(text, ns.start, ns.end).filter(([gs, ge]) => ge > ns.start && gs < ns.end);
+        if (!soloGaps.length) {
+          spans.push(ns);
+          taken.fill(1, ns.start, ns.end);
+          return;
+        }
+        taken.fill(1, ns.start, ns.end);
+        let cur = ns.start;
+        for (const [gs, ge] of soloGaps) {
+          if (cur < gs) spans.push({ ...ns, start: cur, end: gs });
+          cur = Math.max(cur, ge);
+        }
+        if (cur < ns.end) spans.push({ ...ns, start: cur, end: ns.end });
+        return;
+      }
+      let start = ns.start, end = ns.end;
+      let best = ns;
+      for (const o of overlapping) {
+        if (o.start < start) start = o.start;
+        if (o.end > end) end = o.end;
+        if (rank(o.type) < rank(best.type)) best = o;
+      }
+      for (const o of overlapping) {
+        const idx = spans.indexOf(o);
+        if (idx >= 0) spans.splice(idx, 1);
+      }
+      const trusted = overlapping.some((o) => o.trusted) || ns.trusted || best.trusted ? true : undefined;
+      // WHY never swallow amounts: if the union would cover an amount the
+      // amount guard keeps visible, split around it (amount stays readable
+      // but claimed so later learned terms cannot re-hide it).
+      const gaps = findAmountExclusions(text, start, end);
+      taken.fill(1, start, end);
+      if (!gaps.length) {
+        spans.push({ ...best, start, end, trusted });
+        return;
+      }
+      let cur = start;
+      for (const [gs, ge] of gaps) {
+        if (cur < gs) spans.push({ ...best, start: cur, end: gs, trusted });
+        cur = Math.max(cur, ge);
+      }
+      if (cur < end) spans.push({ ...best, start: cur, end: end, trusted });
+    };
+    // WHY fresh dummy taken: helpers skip self-overlaps via their taken arg;
+    // passing a fresh map lets cross-layer overlaps reach addMerged instead
+    // of being dropped here.
+    const fresh = () => new Uint8Array(text.length);
+    for (const s of this._propSpans(text, fresh())) addMerged(s);
     // Step-5 globals: batch-wide terms learned from the whole bundle.
-    spans.push(...this._globalSpans(text, taken));
+    for (const s of this._globalSpans(text, fresh())) addMerged(s);
     // Step-6 trusted header values (+variants, surname widening) hide here as
     // well; the batch flow also adds them as globals for the other files.
-    spans.push(...this._trustedSpans(text, taken));
-    // Step-8 PIN, bank narrations, and (OCR text only) fuzzy OCR names.
-    spans.push(...this._pinSpans(text, taken));
-    spans.push(...this._narrationSpans(text, taken));
-    if (opts.ocr) spans.push(...this._ocrSpans(text, taken));
+    for (const s of this._trustedSpans(text, fresh())) addMerged(s);
+    // Step-8 PIN, postals, bank narrations, concatenated names, and (OCR text only) fuzzy OCR names.
+    // WHY real taken for PIN: it needs the hidden ratio (40% already hidden)
+    // from patterns/trusted above; the rest use fresh maps so cross-layer
+    // overlaps reach addMerged instead of being dropped.
+    for (const s of this._pinSpans(text, taken)) addMerged(s);
+    for (const s of this._postalSpans(text, fresh())) addMerged(s);
+    for (const s of this._narrationSpans(text, fresh())) addMerged(s);
+    for (const s of this._concatSpans(text, fresh())) addMerged(s);
+    if (opts.ocr) for (const s of this._ocrSpans(text, fresh())) addMerged(s);
     // Step-3 number guard: digits-only spans that read as amounts stay
     // visible. Ranges stay claimed (taken) so no learned term re-hides the
     // same digits; the user's own list ("you") and trusted values bypass it.
@@ -1504,16 +2066,52 @@ export class Redactor {
         for (const m of text.matchAll(re)) {
           const start = m.index;
           const end = start + m[0].length;
-          let free = true;
-          for (let i = start; i < end; i++) {
-            if (taken[i]) {
-              free = false;
-              break;
+          // WHY no cross-newline AI spans: a learned term matching across a
+          // line break is split; only non-empty pieces hide, the newline stays.
+          let pieces;
+          if (m[0].includes("\n")) {
+            pieces = [];
+            let off = start;
+            for (const part of m[0].split("\n")) {
+              const ps = off, pe = off + part.length;
+              if (part.trim().length > 0) {
+                const lead = part.length - part.trimStart().length;
+                const trail = part.length - part.trimEnd().length;
+                pieces.push({ start: ps + lead, end: pe - trail });
+              }
+              off = pe + 1;
+            }
+            if (!pieces.length) continue;
+          } else {
+            pieces = [{ start, end }];
+          }
+          const prov = this._provForLearned(m[0]);
+          for (const pc of pieces) {
+            if (pc.end <= pc.start) continue;
+            // WHY shared gate: every line piece passes the same filters as a
+            // whole hit (amounts like AED 0.00 / 0.9035 and generic words like
+            // Service/Manager stay visible); failures are dropped, not merged.
+            const pieceText = text.slice(pc.start, pc.end);
+            if (!passesModelPieceGate(pieceText, type, text, text, pc.start, pc.end)) continue;
+            const overlapping = spans.filter((s) => pc.start < s.end && pc.end > s.start);
+            if (overlapping.length) {
+              addMerged({ start: pc.start, end: pc.end, type, ...prov });
+            } else {
+              // WHY blocked check: the amount guard above removed
+              // amount-visible digits but left them claimed in taken, so a
+              // learned term must not re-hide the same digits here.
+              let blocked = false;
+              for (let i = pc.start; i < pc.end; i++) {
+                if (taken[i]) {
+                  blocked = true;
+                  break;
+                }
+              }
+              if (blocked) continue;
+              taken.fill(1, pc.start, pc.end);
+              spans.push({ start: pc.start, end: pc.end, type, ...prov });
             }
           }
-          if (!free) continue;
-          taken.fill(1, start, end);
-          spans.push({ start, end, type, ...this._provForLearned(m[0]) });
         }
       }
     }

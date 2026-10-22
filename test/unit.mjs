@@ -985,6 +985,271 @@ assert.strictEqual(cleanHit("Dr Priya Nair."), "Priya Nair");
   await r2.learn(["Name: Ravi Kumar Sharma", "MUMBAI SHARMA branch", "SHARMA SHARMA noted"]);
   assert.strictEqual(r2.apply("MUMBAI branch open"), "MUMBAI branch open", "place word stays");
 }
+// --- P1 false-alarm gate: generic cue/label/header/global slips never spread (invented data) ---
+{
+  const { computeGlobals } = await import("../js/redactor.js");
+  // 2-file batch: learn A+B together (pass-2 pre-learn), then redact B.
+  const batchApplyB = async (fileA, fileB) => {
+    const r = new Redactor();
+    await r.learn([fileA, fileB]);
+    return r.apply(fileB);
+  };
+  // (a) sign-off cue must not learn "For" and redact "for" elsewhere
+  {
+    const fileA = "Regards,\nFor any illness unlimited times covered here.";
+    const fileB = "The cover is for any illness here.";
+    assert.strictEqual(await batchApplyB(fileA, fileB), fileB, "sign-off For stays");
+    const rA = new Redactor();
+    await rA.learn([fileA]);
+    rA.apply(fileA);
+    const g = computeGlobals(new Set([fileA, fileB]), rA.report);
+    assert.ok(!g.some((x) => x.text.toLowerCase() === "for"), "For never becomes global");
+  }
+  // (b) Name:/Client: label cue must not learn "Up"/"An"
+  {
+    const fileA = "Client: Up to limits apply for coverage here";
+    const fileB = "Costs go up to limits each year";
+    assert.strictEqual(await batchApplyB(fileA, fileB), fileB, "label Up stays");
+  }
+  {
+    const fileA = "Name: An is a legal heir for the account";
+    const fileB = "He is an heir to the account";
+    assert.strictEqual(await batchApplyB(fileA, fileB), fileB, "label An stays");
+  }
+  // (c) Dear/Hi greeting must not learn "Investor"
+  {
+    const fileA = "Dear Investor,\nThank you for writing.";
+    const fileB = "The investor wrote back today.";
+    assert.strictEqual(await batchApplyB(fileA, fileB), fileB, "greeting Investor stays");
+    const r = new Redactor();
+    await r.learn([fileA]);
+    r.apply(fileA);
+    const g = computeGlobals(new Set([fileA, fileB]), r.report);
+    assert.ok(!g.some((x) => x.text.toLowerCase() === "investor"), "Investor never global");
+  }
+  // (d) header must not trust "Registered" nor spread it batch-wide
+  {
+    const fileA = "Name: Registered\nFlat 12, Lotus Court";
+    const fileB = "The status shows registered members here.";
+    assert.strictEqual(await batchApplyB(fileA, fileB), fileB, "header Registered stays");
+    const r = new Redactor();
+    await r.learn([fileA]);
+    assert.ok(![...r.trusted.values()].some((v) => v.text.toLowerCase() === "registered"), "Registered never trusted");
+    r.apply(fileA);
+    const g = computeGlobals(new Set([fileA, fileB]), r.report);
+    assert.ok(!g.some((x) => x.text.toLowerCase() === "registered"), "Registered never global");
+    const r2 = new Redactor();
+    await r2.learn([fileA, fileB]);
+    for (const x of g) r2.addGlobal(x.text, x.type, x.prov);
+    assert.strictEqual(r2.apply(fileB), fileB, "addGlobal gate keeps Registered out");
+  }
+  // positive: a real cue name still hides
+  {
+    const r = new Redactor();
+    await r.learn(["Regards,\nAnita Desai\nThank you"]);
+    assert.ok(!r.apply("Regards,\nAnita Desai\nThank you").includes("Anita"), "real sign-off name hides");
+  }
+}
+// --- P2 recall gaps (invented data) ---
+{
+  // (e) address block under a salutation-name heading
+  {
+    const r = new Redactor();
+    await r.learn(["MR. VIKRAM SANJAY PATIL\nB2203,512-AL NAHDA,NORTH THIRD,\nPREMISE NUMBER: 700123456,33445\nDUBAI"]);
+    const out = r.apply("B2203,512-AL NAHDA,NORTH THIRD,");
+    assert.ok(!out.includes("B2203"), "unit/street line hides");
+    const out2 = r.apply("PREMISE NUMBER: 700123456,33445");
+    assert.ok(!out2.includes("33445"), "5-digit postal after comma hides");
+    assert.match(out2, /\[ADDRESS\]|\[ID\]/);
+  }
+  {
+    const r = new Redactor();
+    await r.learn(["MR. VIKRAM SANJAY PATIL\nB2203,512-AL NAHDA,NORTH THIRD,\nEMIRATES-33445-"]);
+    assert.ok(!r.apply("EMIRATES-33445-").includes("33445"), "EMIRATES-22334-style postal hides");
+  }
+  // (f) locality line inside a detected block
+  {
+    const r = new Redactor();
+    await r.learn(["Name: Vikram Sanjay Patil\nFlat 12, Lotus Court\nLink Road\nMalad (W)\nMumbai\nPINCODE: 400064"]);
+    assert.ok(!r.apply("Malad (W)").includes("Malad"), "locality hides");
+  }
+  // (g) UPI payee segment hides, amounts stay
+  {
+    const r = new Redactor();
+    await r.learn(["Name: Vikram Sanjay Patil"]);
+    const line = "UPI/VIKRAM SA/vikramsanjay/UPI/Some Bank/12345 done";
+    const out = r.apply(line);
+    assert.ok(!out.includes("VIKRAM SA"), "payee segment hides");
+    assert.ok(out.includes("12345"), "amount stays visible");
+  }
+  // (h) concatenated name parts (lowercase) hide, incl. >=10-char prefix
+  {
+    const r = new Redactor();
+    await r.learn(["Name: Vikram Sanjay Patil"]);
+    assert.ok(!r.apply("contact vikrampatil today").includes("vikrampatil"), "first+last glued hides");
+    assert.ok(!r.apply("contact vikrampati here").includes("vikrampati"), "10+ char prefix hides");
+  }
+  // (i) overlapping spans merge to their union; AI hits never cross a newline
+  {
+    const doc = "MR.ROHAN AMIT KULKARNI\nB2203,512-AL NAHDA,NORTH THIRD,\nPREMISE NUMBER: 600123456,22334\nDUBAI";
+    const det = {
+      size: 1,
+      recognize: async () => [{ label: "person", word: "ROHAN AMIT KULKARNI\nB2203", score: 0.9 }],
+    };
+    const r = new Redactor({ detector: det });
+    await r.learn([doc]);
+    const out = r.apply(doc);
+    for (const s of ["ROHAN", "KULKARNI", "B2203", "NORTH THIRD", "600123456", "22334"])
+      assert.ok(!out.includes(s), `${s} hidden: ${out}`);
+    // No learned/AI span crosses a newline.
+    for (const sp of r.spans(doc)) assert.ok(!doc.slice(sp.start, sp.end).includes("\n"), "span crosses newline");
+    // A nearby amount stays visible (number guard still applies).
+    const withAmt = `${doc}\nBalance Rs 12,345.00 due`;
+    assert.ok(r.apply(withAmt).includes("12,345.00"), "amount stays visible");
+  }
+}
+// --- newline-split model pieces never leak amounts/generics (invented data) ---
+{
+  // (a) role + currency amount: neither piece may hide anywhere.
+  {
+    const det = { size: 1, recognize: async () => [{ label: "person", word: "Asset Manager\nAED 0.00", score: 0.9 }] };
+    const r = new Redactor({ detector: det });
+    const doc = "Asset Manager\nAED 0.00 due";
+    await r.learn([doc]);
+    const out = r.apply(doc);
+    assert.ok(out.includes("Manager"), `Manager stays: ${out}`);
+    assert.ok(out.includes("0.00"), `0.00 stays: ${out}`);
+    assert.strictEqual(r.apply("Manager approved"), "Manager approved");
+    assert.strictEqual(r.apply("Balance 0.00 due"), "Balance 0.00 due");
+  }
+  // (b) generic word + number: neither hides.
+  {
+    const det = { size: 1, recognize: async () => [{ label: "person", word: "Service\n118160", score: 0.9 }] };
+    const r = new Redactor({ detector: det });
+    const doc = "Service\n118160 noted";
+    await r.learn([doc]);
+    const out = r.apply(doc);
+    assert.ok(out.includes("Service"), `Service stays: ${out}`);
+    assert.ok(out.includes("118160"), `118160 stays: ${out}`);
+    assert.strictEqual(r.apply("Service team"), "Service team");
+  }
+  // (c) currency amount on its own line stays visible in a 2-file batch.
+  {
+    const det = {
+      size: 1,
+      recognize: async (w) => (String(w || "").includes("1181600") ? [{ label: "person", word: "Rs. 1181600", score: 0.9 }] : []),
+    };
+    const fileA = "Note one\nRs. 1181600\nDone";
+    const fileB = "Note two\nRs. 1181600\nDone";
+    const r = new Redactor({ detector: det });
+    await r.learn([fileA, fileB]);
+    assert.strictEqual(r.apply(fileB), fileB);
+  }
+}
+// --- currency codes are never PII (invented data) ---
+{
+  const { passesModelPieceGate, isFilteredModelHit, isCurrencyCode, computeGlobals } = await import("../js/redactor.js");
+  const { isNameLike } = await import("../js/handlers.js");
+  // a model hit carrying a currency code is a header label, not a person
+  {
+    const det = { size: 1, recognize: async () => [{ label: "person", word: "Market Value (INR)", score: 0.9 }] };
+    const r = new Redactor({ detector: det });
+    const doc = "Asset\tMarket Value (INR)\tLocation";
+    await r.learn([doc]);
+    assert.strictEqual(r.apply(doc), doc, "header with currency code stays");
+    assert.deepStrictEqual(r.spans(doc), [], "no span touches the header");
+  }
+  // lone codes/symbols are rejected by every layer
+  for (const code of ["INR", "USD", "AED", "EUR", "GBP", "SGD", "Rs", "Rs.", "₹"]) {
+    assert.strictEqual(isCurrencyCode(code), true, code);
+    assert.strictEqual(isFilteredModelHit(code, "NAME", `value ${code} here`), true, `${code} filtered`);
+    assert.strictEqual(passesModelPieceGate(code, "NAME", `value ${code} here`), false, `${code} gated`);
+    assert.strictEqual(passesModelPieceGate(code, "ID", `value ${code} here`), false, `${code} id gated`);
+    assert.strictEqual(isNameLike(code), false, `${code} is not name-like`);
+  }
+  assert.strictEqual(isCurrencyCode("Ursula"), false, "names containing code letters pass");
+  assert.strictEqual(isCurrencyCode("Ravi Mehta"), false, "real names pass");
+  // codes never become batch-wide, even when quoted once
+  const g = computeGlobals(new Set(["Market Value (INR) here"]), [{ quote: "INR", type: "ID", source: "gliner", label: "customer id", score: 0.9 }]);
+  assert.ok(!g.some((x) => x.text === "INR"), "INR never global");
+  const g2 = computeGlobals(new Set(["Market Value (INR) here"]), [{ quote: "Market Value (INR)", type: "NAME", source: "gliner", label: "person", score: 0.9 }]);
+  assert.ok(!g2.some((x) => /INR/.test(x.text)), "name carrying a code never global");
+  {
+    const r = new Redactor();
+    r.addGlobal("INR", "ID", { source: "gliner", label: "customer id", score: 0.9 });
+    assert.strictEqual(r.globals.length, 0, "addGlobal keeps codes out");
+    assert.strictEqual(r.apply("Market Value (INR)"), "Market Value (INR)");
+  }
+}
+// --- plain table numbers stay visible (invented data) ---
+{
+  const { computeGlobals } = await import("../js/redactor.js");
+  const doc = "Name: Ravi Kumar Sharma\nSubscription Amount \n52340 CCDs \n523400 \nRAVI MEHTA \nNon Promoter \n523400 \n52340 \n0.4512";
+  const r = new Redactor();
+  await r.learn([doc]);
+  const out = r.apply(doc);
+  for (const n of ["523400", "52340", "0.4512"])
+    assert.ok(out.includes(n), `${n} stays visible: ${out}`);
+  assert.ok(!out.includes("RAVI MEHTA"), "the name still hides");
+  // a pure <=7-digit model quote with no ID label never goes batch-wide
+  const g = computeGlobals(new Set([doc]), [
+    { quote: "523400", type: "ID", source: "gliner", label: "customer id", score: 0.9 },
+    { quote: "52340", type: "ID", source: "needle", question: "id", run: 0, variant: 0 },
+  ]);
+  assert.ok(!g.some((x) => x.text === "523400"), "523400 never global");
+  assert.ok(!g.some((x) => x.text === "52340"), "52340 never global");
+  {
+    const r2 = new Redactor();
+    r2.addGlobal("523400", "ID", { source: "gliner", label: "customer id", score: 0.9 });
+    assert.strictEqual(r2.globals.length, 0, "addGlobal keeps plain numbers out");
+  }
+  // 9+ digit IDs and labelled numbers still work
+  {
+    const r3 = new Redactor();
+    await r3.learn(["DP ID 123456789"]);
+    assert.ok(!r3.apply("call 123456789 now").includes("123456789"), "9-digit ID hides");
+    assert.ok(!r3.apply("DP ID 123456789").includes("123456789"), "labelled ID hides");
+  }
+}
+// --- PIN after a label or hyphen-address hides again (invented data) ---
+{
+  // label branch needs no hidden context and no trusted name
+  for (const line of ["PINCODE: 400064", "PIN: 400064", "Pin Code: 400064"]) {
+    const r = new Redactor();
+    await r.learn([`Flat 12, Lotus Court\n${line}`]);
+    assert.ok(!r.apply(line).includes("400064"), `${line} hides`);
+    assert.ok(!r.apply(`Flat 12, Lotus Court\n${line}`).includes("400064"), `${line} hides in block`);
+  }
+  // hyphenated address tail hides as well
+  {
+    const r = new Redactor();
+    await r.learn(["Flat 12, Lotus Court\nMumbai,Maharashtra-400064"]);
+    assert.ok(!r.apply("Mumbai,Maharashtra-400064").includes("400064"), "hyphen PIN hides");
+  }
+  // table rows and unlabelled short numbers still stay
+  {
+    const r = new Redactor();
+    await r.learn(["Flat 12, Lotus Court\nPINCODE: 400064"]);
+    assert.strictEqual(r.apply("Qty\t400064\tPrice"), "Qty\t400064\tPrice", "tab row stays");
+    assert.strictEqual(r.apply("Call 400064 today"), "Call 400064 today", "unlabelled context stays");
+  }
+}
+// --- bare policy/ID numbers survive the piece gate (invented data) ---
+{
+  const { passesModelPieceGate } = await import("../js/redactor.js");
+  // the model labels a bare 9-digit run in a policy table as an ID number
+  const det = { size: 1, recognize: async () => [{ label: "customer id", word: "612345678", score: 0.9 }] };
+  const r = new Redactor({ detector: det });
+  const doc = "Agency Code\n/\n612345678\nRavi Mehta";
+  await r.learn([doc]);
+  assert.ok(!r.apply(doc).includes("612345678"), "bare 9-digit policy number hides");
+  assert.strictEqual(passesModelPieceGate("612345678", "ID", doc), true, "gate keeps plain IDs");
+  // the amount guard stays for formatted or currency-marked numbers
+  assert.strictEqual(passesModelPieceGate("Rs. 612,345,678", "ID", doc), false, "comma amount dropped");
+  assert.strictEqual(passesModelPieceGate("612345678.00", "ID", doc), false, "decimal amount dropped");
+  assert.strictEqual(passesModelPieceGate("INR 612345678", "ID", "Balance INR 612345678 here"), false, "currency amount dropped");
+  assert.strictEqual(passesModelPieceGate("99887766", "ID", "Balance 99887766 here"), false, "money-word number dropped");
+}
 // --- OCR word->box mapping (js/ocr.js pure functions, no worker needed) ---
 {
   const { buildOcrPage, boxesForSpans, scaleBox } = await import("../js/ocr.js");
