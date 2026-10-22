@@ -1,13 +1,12 @@
 #!/bin/bash
-# Downloads the GLiNER onnx weights (183 MB, not committed: over GitHub's
-# 100 MB file limit). No npm needed. Skips the download when the file is
-# already present with the right SHA-256; verifies the checksum afterwards
-# and fails loudly otherwise.
+# Downloads the GLiNER onnx weights (83 MB, not committed: keeps the repo
+# light). No npm needed. Skips the download when the file is already present
+# with the right SHA-256; verifies the checksum afterwards and fails loudly otherwise.
 set -euo pipefail
 cd "$(dirname "$0")"
-DEST="../vendor/gliner/models/onnx-community/gliner_small-v2.1/onnx/model_quantized.onnx"
-URL="https://huggingface.co/onnx-community/gliner_small-v2.1/resolve/main/onnx/model_quantized.onnx"
-SHA="c76c90920547fd937aaf505e7f2de5ec73168bf1c25abbb55a298104cb061400"
+DEST="../vendor/gliner/models/knowledgator/gliner-pii-small-v1.0/onnx/model_quint8.onnx"
+URL="https://huggingface.co/knowledgator/gliner-pii-small-v1.0/resolve/main/onnx/model_quint8.onnx"
+SHA="891589426ee96f2748b16439f44fad8c3f97e198e002a6637e58dee989500216"
 
 sha_of() {
   if command -v sha256sum >/dev/null 2>&1; then

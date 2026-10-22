@@ -497,7 +497,7 @@ async function redactImage(file, redactor, status, ext) {
     status("Reading text in the picture…");
     const { text, ranges } = await ocrCanvas(work);
     await learnWithBudget(redactor, [text], status, warnings);
-    const spans = redactor.spans(text);
+    const spans = redactor.spans(text, { ocr: true });
     if (spans.length) {
       const base = redactor.report.length;
       redactor.count(spans, text);
@@ -685,7 +685,7 @@ async function redactDocx(file, redactor, status, opts = {}) {
   for (let n = 0; n < pictures.length; n++) {
     const pic = pictures[n];
     if (!pic.text) continue;
-    const spans = redactor.spans(pic.text);
+    const spans = redactor.spans(pic.text, { ocr: true });
     if (!spans.length) continue;
     const base = redactor.report.length;
       redactor.count(spans, pic.text);
@@ -1004,7 +1004,7 @@ async function redactPdf(file, redactor, status, opts = {}) {
     if (!onlyUnlock && ocr?.text) {
       // Boxes over the OCR'd words (scan pages and embedded pictures),
       // tagged so the report says where the text came from.
-      const ocrSpans = redactor.spans(ocr.text);
+      const ocrSpans = redactor.spans(ocr.text, { ocr: true });
       const base = redactor.report.length;
       redactor.count(ocrSpans, ocr.text);
       const pageNo = String(i + 1);
@@ -1081,7 +1081,10 @@ function friendly(err, ext) {
   return err;
 }
 export async function redactFile(file, redactor, status, opts = {}) {
-  redactor.resetFile();
+  // WHY keepKnowledge: batch pass 2 pre-loads batch-wide terms into the
+  // redactor; only the per-file tally resets, never the knowledge.
+  if (opts.keepKnowledge) redactor.resetCounts();
+  else redactor.resetFile();
   const ext = extOf(file.name);
   try {
     switch (ext) {

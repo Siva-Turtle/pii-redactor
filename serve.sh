@@ -1,10 +1,10 @@
 #!/bin/bash
 # Shared by Start-Mac.command and start-linux.sh.
 cd "$(dirname "$0")" || exit 1
-# One-time 183 MB model download (skipped when already present, so this stays
+# One-time 83 MB model download (skipped when already present, so this stays
 # offline-friendly). The app still works without it (patterns only).
-if [ ! -f "vendor/gliner/models/onnx-community/gliner_small-v2.1/onnx/model_quantized.onnx" ]; then
-  echo "  AI model not found, downloading it now (one time, ~183 MB)..."
+if [ ! -f "vendor/gliner/models/knowledgator/gliner-pii-small-v1.0/onnx/model_quint8.onnx" ]; then
+  echo "  AI model not found, downloading it now (one time, ~83 MB)..."
   if ! bash tools/fetch-model.sh; then
     echo "  Could not download the AI model. Continuing with pattern checks only."
   fi

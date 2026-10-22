@@ -305,7 +305,7 @@ const terminalDs = (ds) => ds === "done" || ds === "error";
       const [f, location, page, type, quote, foundBy, detail] = r;
       assert.strictEqual(f, file, "csv file column");
       assert.ok(location && type && quote && foundBy, `${file}: row has location/type/quote/found_by`);
-      assert.ok(["script", "script: name cue", "script: column header", "you", "needle"].includes(foundBy), `${file}: known found_by (${foundBy})`);
+      assert.ok(["script", "script: name cue", "script: column header", "script: batch", "you", "needle", "gliner"].includes(foundBy), `${file}: known found_by (${foundBy})`);
       assert.ok(await quotesInOriginal(quote), `${file}: quote occurs in original: ${JSON.stringify(quote.slice(0, 60))}`);
       allReportRows.push({ base, location, page, type, quote, foundBy, detail });
     }
@@ -349,16 +349,25 @@ const terminalDs = (ds) => ds === "done" || ds === "error";
       assert.ok(locs.some((l) => /paragraph/.test(l)), "sample.docx: paragraph locations");
     }
   }
-  // Needle entries for the finance sample (AI on only).
+  // AI entries for the finance sample (AI on only): the PII-small model
+  // reports person/address/phone/email/PAN/folio/ID labels in one call, and
+  // the batch flow re-hides them everywhere (found_by "gliner" or the
+  // batch-wide "script: batch").
   if (AI_ON && names.includes("finance.txt")) {
     const fin = allReportRows.filter((r) => r.base === "finance.txt");
+    const person = fin.find((r) => /Rajesh|Meera|Sharma/.test(unguard(r.quote)));
+    const addr = fin.find((r) => /Flat|Sunrise|Andheri|Mumbai/.test(unguard(r.quote)));
+    const batch = fin.find((r) => r.foundBy === "script: batch");
+    assert.ok(person, "finance.txt: person name hidden");
+    assert.ok(addr, "finance.txt: address hidden");
+    assert.ok(batch, "finance.txt: batch-wide re-hiding happened");
+    // Recall the pattern layer alone misses: the unlabelled policy number
+    // and the Form-16 password only the AI finds.
     const lic = fin.find((r) => unguard(r.quote).includes("LIC/0034/998877"));
     const sec = fin.find((r) => /sunshine99/i.test(unguard(r.quote)));
-    assert.ok(lic, "finance.txt: LIC/0034/998877 row present");
-    assert.strictEqual(lic.foundBy, "needle", "finance.txt: LIC found by needle");
-    assert.ok(sec, "finance.txt: sunshine99 row present");
-    assert.strictEqual(sec.foundBy, "needle", "finance.txt: password found by needle");
-    console.log("needle rows ok for finance.txt");
+    assert.ok(lic, "finance.txt: LIC/0034/998877 hidden (AI)");
+    assert.ok(sec, "finance.txt: sunshine99 hidden (AI)");
+    console.log("AI rows ok for finance.txt");
   }
 
   // ------------------------------------------------------------- downloads

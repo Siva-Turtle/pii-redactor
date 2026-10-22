@@ -707,10 +707,12 @@ assert.strictEqual(cleanHit("Dr Priya Nair."), "Priya Nair");
     assert.strictEqual(r.apply("page 10 has (IN302814) in a table"), "page 10 has ([DEMAT]) in a table");
   }
   // folio with a trailing '/ NN' suffix: the number part hides elsewhere
+  // (the step-3 number guard keeps bare amounts visible, so the bare repeat
+  // carries an ID cue here; a money-word-only label stays readable).
   {
     const r = new Redactor();
     await r.learn(["folio no 12345678/45 verified"]);
-    const out = r.apply("balance 12345678 / 45 held");
+    const out = r.apply("balance of folio 12345678 / 45 held");
     assert.ok(!out.includes("12345678"), `folio leak: ${out}`);
     assert.match(out, /\[FOLIO\]/);
   }
@@ -722,6 +724,266 @@ assert.strictEqual(cleanHit("Dr Priya Nair."), "Priya Nair");
     assert.strictEqual(r.apply("quantity 561 units"), "quantity 561 units");
     assert.ok(r.apply("prefix IN3028140 suffix").includes("IN3028140"), "longer number must not partially match");
   }
+}
+// --- step-2 model-hit filter (invented data; applied to every AI hit) ---
+{
+  const { isFilteredModelHit, hasIdWord, hasMoneyWord } = await import("../js/redactor.js");
+  const r = new Redactor();
+  const drop = (hit, kind, working) => r._accept(hit, kind, working) === null;
+  // generic label/relation words (whole hit, case-insensitive, plural s)
+  for (const h of ["Nominee", "spouse", "Self", "KYC", "Investors", "clients", "Holders", "name", "Date of Birth", "DOBs", "Registered Mobile", "First Holder", "second holders", "e-mail", "Mobile Number", "Indian Citizen", "Account Holder"]) {
+    assert.ok(drop(h, "NAME", `note about ${h} here`), `${h} filtered`);
+    assert.ok(isFilteredModelHit(h, "NAME", ""), `${h} filtered (direct)`);
+  }
+  // job titles / roles, plural ok
+  for (const h of ["Branch Manager", "relationship managers", "Insurance Advisor", "Service Provider", "Account Officer", "Trustee", "Agents", "RIA"]) {
+    assert.ok(drop(h, "NAME", `contact ${h} today`), `${h} filtered`);
+  }
+  // short all-lowercase words
+  for (const h of ["abc", "tax", "fund"]) assert.ok(drop(h, "NAME", `note ${h} here`), `${h} filtered`);
+  // ISIN / SEBI registration / dates are never PII hits
+  assert.ok(drop("INF247L01023", "ACCOUNT", "holding INF247L01023 here"), "ISIN account");
+  assert.ok(drop("INA123456789", "ID", "ref INA123456789 noted"), "SEBI number");
+  assert.ok(drop("02-04-1987", "NAME", "born 02-04-1987 today"), "date");
+  // amounts: commas/decimals, or 6 digits or fewer
+  assert.ok(drop("12,345.67", "NAME", "total 12,345.67 here"), "comma amount");
+  assert.ok(drop("123456", "ID", "code 123456 here"), "6-digit run");
+  assert.ok(!drop("1234567", "ID", "Client ID 1234567 here"), "7-digit with ID cue kept");
+  // a hit across table cells is cut; the longest passing piece wins
+  assert.deepStrictEqual(r._accept("Anita Desai\nSalary", "NAME", "Anita Desai\nSalary 50000")?.term, "Anita Desai");
+  assert.strictEqual(r._accept("Self\nSpouse", "NAME", "Self\nSpouse row"), null, "all pieces filtered");
+  // digits-only AI hits need an ID cue without a money word
+  assert.ok(drop("99887766", "ID", "Balance 99887766 here"), "amount-like digits dropped");
+  assert.ok(!drop("99887766", "ID", "Customer ID 99887766 here"), "ID-cued digits kept");
+  assert.ok(drop("9876543210", "PHONE", "Call 9876543210 now"), "uncued phone digits dropped");
+  assert.ok(!drop("9876543210", "PHONE", "account 9876543210 now"), "ID-cued phone digits kept");
+  // "emi" must not match inside "PREMISE"
+  assert.strictEqual(hasMoneyWord("PREMISE NUMBER"), false, "emi inside PREMISE");
+  assert.strictEqual(hasMoneyWord("emi paid monthly"), true, "bare emi");
+  assert.strictEqual(hasIdWord("Cust ID 1"), true);
+  assert.strictEqual(hasIdWord("nothing here"), false);
+}
+// --- step-3 number guard (amounts stay visible; nearest label wins) ---
+{
+  const { isAmountVisible, isDigitsOnlyText } = await import("../js/redactor.js");
+  assert.strictEqual(isDigitsOnlyText("12,345.67"), true);
+  assert.strictEqual(isDigitsOnlyText("$ 100"), true);
+  assert.strictEqual(isDigitsOnlyText("ABCDE1234F"), false);
+  assert.strictEqual(isDigitsOnlyText("02-04-1987"), false, "dashes are not digits-only");
+  // money formats stay visible
+  assert.strictEqual(isAmountVisible("Balance 12,345.67", 8, 17), true, "comma amount");
+  assert.strictEqual(isAmountVisible("Cost 1234.5", 5, 11), true, "decimal amount");
+  assert.strictEqual(isAmountVisible("Fee $100", 4, 8), true, "leading $");
+  assert.strictEqual(isAmountVisible("IDs 123456789,54321", 4, 19), false, "glued IDs are not money format");
+  // nearest label wins
+  assert.strictEqual(isAmountVisible("Interest paid on account (Cust ID 123456789)", 35, 44), false, "ID nearer than money");
+  assert.strictEqual(isAmountVisible("Balance 123456789", 8, 17), true, "money label only");
+  assert.strictEqual(isAmountVisible("note 12345678 held", 5, 13), false, "no cue hides");
+  // end-to-end through spans(): a bare amount with a money label stays
+  {
+    const r = new Redactor();
+    await r.learn(["account no 1234567890123456"]);
+    assert.strictEqual(r.apply("Balance 1234567890123456 held"), "Balance 1234567890123456 held", "money-labelled amount stays");
+    assert.ok(!r.apply("PREMISE NUMBER 1234567890123456 held").includes("1234567890123456"), "PREMISE NUMBER hides despite Interest-free context");
+  }
+  {
+    const r = new Redactor();
+    await r.learn(["DP ID 123456789"]);
+    assert.ok(!r.apply("Interest on PREMISE NUMBER 123456789 paid").includes("123456789"), "ID nearer than money hides");
+    assert.strictEqual(r.apply("Interest paid 123456789 today"), "Interest paid 123456789 today", "money word keeps it visible");
+  }
+}
+// --- step-4 security names stay visible (invented fund data) ---
+{
+  const det = { size: 1, recognize: async () => [{ label: "person", word: "HDFC Flexi Cap", score: 0.9 }] };
+  const r = new Redactor({ detector: det });
+  const doc = "Holding HDFC Flexi Cap\nINF247L01023 units allotted\nBonus declared\nExtra line";
+  await r.learn([doc]);
+  assert.strictEqual(r.apply(doc), doc, "fund name near ISIN is not a person");
+  assert.strictEqual(r.apply("HDFC declares a dividend"), "HDFC declares a dividend", "single security word stays");
+  // a real name in the same file still hides
+  const det2 = {
+    size: 1,
+    recognize: async (w) => (w.includes("Anita") ? [{ label: "person", word: "Anita Desai", score: 0.9 }] : [{ label: "person", word: "HDFC Flexi Cap", score: 0.9 }]),
+  };
+  const r2 = new Redactor({ detector: det2 });
+  await r2.learn(["Contact Anita Desai today", doc]);
+  assert.ok(!r2.apply("Contact Anita Desai today").includes("Anita"), "real name hides");
+  assert.strictEqual(r2.apply("HDFC Flexi Cap held"), "HDFC Flexi Cap held", "fund name stays");
+}
+// --- step-5 batch-wide globals (invented data; agreement + boundaries) ---
+{
+  const { computeGlobals, deriveAddressParts, countOccurrences } = await import("../js/redactor.js");
+  const texts = ["Client: Anita Desai, folio 123456", "Anita Desai called about folio 123456"];
+  // ID-like terms always go on; a name flagged in 2 of 2 appearances goes on
+  const quotes = [
+    { quote: "Anita Desai", type: "NAME", source: "cue", cue: "Dear/Hi greeting" },
+    { quote: "Anita Desai", type: "NAME", source: "cue", cue: "Dear/Hi greeting" },
+    { quote: "123456", type: "FOLIO", source: "script", rule: "FOLIO" },
+  ];
+  const g = computeGlobals(new Set(texts), quotes);
+  assert.ok(g.some((x) => x.text === "Anita Desai"), "agreed name goes batch-wide");
+  assert.ok(g.some((x) => x.text === "123456"), "ID-like term always goes on");
+  // a one-off model slip below 30% agreement does not spread
+  const texts2 = ["Wealth alpha filed", "Wealth beta filed", "Wealth gamma filed", "Wealth delta filed"];
+  const slip = computeGlobals(new Set(texts2), [{ quote: "Wealth", type: "NAME", source: "gliner", label: "person", score: 0.5 }]);
+  assert.ok(!slip.some((x) => x.text === "Wealth"), "one-off slip gated");
+  // digit boundaries: an ID glued to a letter still matches
+  assert.strictEqual(countOccurrences("ref X987654321 here", "987654321"), 1, "digit edges ignore letters");
+  assert.strictEqual(countOccurrences("call 9876543210 now", "987654321"), 0, "no partial digit match");
+  // address parts: PO box number, locality pieces, not www/@ lines
+  const parts = deriveAddressParts([
+    { quote: "Flat 12, Lotus Society, Pune 411001", type: "ADDRESS", source: "gliner", label: "address", score: 0.9 },
+    { quote: "see www.example.com for info", type: "ADDRESS", source: "gliner", label: "address", score: 0.5 },
+    { quote: "Ravi Sharma", type: "NAME", source: "cue", cue: "x" },
+  ]);
+  assert.ok(parts.some((x) => x.text === "411001"), "5+ digit run kept");
+  assert.ok(parts.some((x) => x.text === "Lotus Society"), "address piece kept");
+  assert.ok(!parts.some((x) => /example/.test(x.text)), "www line skipped");
+  assert.ok(!parts.some((x) => x.text === "Ravi Sharma"), "plain name is not an address part");
+  // end-to-end across two files: labelled in A, bare in B
+  {
+    const rA = new Redactor();
+    await rA.learn(["Client Name: Anita Desai", "folio no 123456/78"]);
+    const outA = rA.apply("Client Name: Anita Desai, folio no 123456/78");
+    const textsB = ["Anita Desai visited", "balance 123456 held"];
+    const globals = computeGlobals(new Set(["Client Name: Anita Desai, folio no 123456/78", ...textsB]), rA.report.map((e) => ({ ...e })));
+    const rB = new Redactor();
+    await rB.learn(textsB);
+    for (const x of globals) rB.addGlobal(x.text, x.type, x.prov);
+    assert.ok(!rB.apply("Anita Desai visited").includes("Anita"), "bare name hides in file B");
+  }
+  // "you" quotes never become globals (the manual list already applies)
+  assert.deepStrictEqual(computeGlobals(new Set(["a Project Falcon memo"]), [{ quote: "Project Falcon", type: "CUSTOM", source: "you", entry: "Project Falcon" }]), []);
+}
+// --- step-8 rules (invented data) ---
+{
+  const { fileNameIds, edits1 } = await import("../js/redactor.js");
+  // loose label-anchored IDs: label decides the type, only digits hide
+  for (const [text, type, leak] of [
+    ["premise no X123456", "ID", "123456"],
+    ["consumer number 667788", "ID", "667788"],
+    ["contract no 445566", "ID", "445566"],
+    ["member id 778899", "ID", "778899"],
+    ["uid no 112233", "ID", "112233"],
+    ["client code 445566", "ID", "445566"],
+    ["policy#998877", "POLICY", "998877"],
+    ["CIF#654321 noted", "ACCOUNT", "654321"],
+  ]) {
+    const m = mask(text);
+    assert.match(m, new RegExp(`\\[${type}\\]`), text);
+    assert.ok(!m.includes(leak), `${text} leaked ${leak}: ${m}`);
+  }
+  // PREMISE NUMBER hides even with "Interest" earlier on the line
+  {
+    const r = new Redactor();
+    await r.learn(["premise no 123456789 filed"]);
+    assert.ok(!r.apply("Interest on PREMISE NUMBER 123456789 paid").includes("123456789"), "premise id hides");
+  }
+  // Emirates ID: Luhn-checked (784198012345678 valid, …679 bad check digit)
+  assert.match(mask("Emirates ID 784-1980-1234567-8 held"), /\[ID\]/, "valid Emirates ID");
+  assert.ok(!mask("Emirates ID 784-1980-1234567-8 held").includes("784"), "valid Emirates ID hidden");
+  assert.strictEqual(mask("Emirates ID 784-1980-1234567-9 held"), "Emirates ID 784-1980-1234567-9 held", "bad check digit stays");
+  // file-name IDs: 6–15 digit runs, not 20yymmdd timestamps
+  assert.deepStrictEqual(fileNameIds("statement-12345678.pdf"), ["12345678"]);
+  assert.deepStrictEqual(fileNameIds("stmt-20240115.pdf"), [], "timestamp skipped");
+  assert.deepStrictEqual(fileNameIds("a1b2.pdf"), [], "short runs skipped");
+  assert.deepStrictEqual(fileNameIds("policy 9988774455667788 x"), ["998877445566778"], "15-digit cap");
+  assert.ok(edits1("KUMOR", "KUMAR"), "one substitution");
+  assert.ok(edits1("KUMA", "KUMAR"), "one deletion");
+  assert.ok(!edits1("KUMAR", "SHARMA"), "far apart");
+  // address block: a bare trusted-name line opens up to 4 address lines
+  {
+    const r = new Redactor();
+    await r.learn(["Name: Ravi Kumar Sharma"]);
+    await r.learn(["Ravi Kumar Sharma\nFlat 9, Rose Villa\nSubject:\nPlot 7, Green Park"]);
+    assert.ok(!r.apply("Flat 9, Rose Villa").includes("Flat 9"), "block line trusted");
+    assert.strictEqual(r.apply("Plot 7, Green Park"), "Plot 7, Green Park", "stops at Subject:");
+  }
+  // PIN: end-of-line 6 digits with hidden address context hides; tab rows stay
+  {
+    const r = new Redactor();
+    await r.learn(["Name: Ravi Kumar Sharma\nFlat 12, Lotus Society\nPune 411001"]);
+    assert.ok(!r.apply("Flat 12, Lotus Society, Pune 411001").includes("411001"), "PIN hidden in address line");
+    assert.strictEqual(r.apply("Qty\t411001\tPrice"), "Qty\t411001\tPrice", "tab row of numbers stays");
+    assert.strictEqual(r.apply("Call 411001 today"), "Call 411001 today", "unhidden context stays");
+  }
+  // OCR pages only: one-edit words and glued trusted words
+  {
+    const r = new Redactor();
+    await r.learn(["Name: Ravi Kumar Sharma"]);
+    const ocr = "Contact KUMOR at RAVISHARMA today";
+    const spans = r.spans(ocr, { ocr: true });
+    const covered = (s) => spans.some((sp) => ocr.slice(sp.start, sp.end).includes(s));
+    assert.ok(covered("KUMOR"), "one-edit OCR word hides");
+    assert.ok(covered("RAVISHARMA"), "glued OCR words hide");
+    assert.strictEqual(r.apply("Contact KUMOR today"), "Contact KUMOR today", "non-OCR text untouched");
+  }
+  // bank narrations only: fixed-width prefixes between delimiters
+  {
+    const r = new Redactor();
+    await r.learn(["Name: Ravi Kumar Sharma"]);
+    const line = "UPI/SHAR/9876543210/payment done";
+    const spans = r.spans(line);
+    assert.ok(spans.some((sp) => line.slice(sp.start, sp.end) === "SHAR"), "narration prefix hides");
+    assert.strictEqual(r.apply("SHAR went home early"), "SHAR went home early", "no cue word: stays");
+    assert.strictEqual(r.apply("UPI/CUST/9876543210 done"), "UPI/CUST/[PHONE] done", "common word stays, number still hides");
+  }
+}
+// --- step-6 statement-header layer (invented data; trusted, variants, widening) ---
+{
+  const { extractHeader } = await import("../js/statement-header.js");
+  const { nameVariants } = await import("../js/redactor.js");
+  const text = [
+    "Consolidated Account Statement",
+    "Name: Ravi Kumar Sharma",
+    "Flat 12, Lotus Society",
+    "Pune 411001",
+    "Email: ravi.sharma@example.com",
+    "Mobile: +91 98765 43210",
+    "PAN: ABCDE1234F",
+    "Folio No: 12345678/45",
+    "Client ID: C99887766",
+    "Nominee: Anita Sharma",
+  ].join("\n");
+  const h = extractHeader(text);
+  const has = (v, t) => h.some((x) => x.value === v && x.type === t);
+  assert.ok(has("Ravi Kumar Sharma", "NAME"), "holder name");
+  assert.ok(has("Flat 12, Lotus Society", "ADDRESS"), "address line 1");
+  assert.ok(has("Pune 411001", "ADDRESS"), "address line 2");
+  assert.ok(has("ravi.sharma@example.com", "EMAIL"), "email");
+  assert.ok(has("ABCDE1234F", "PAN"), "pan");
+  assert.ok(has("12345678", "FOLIO"), "folio base before / NN");
+  assert.ok(has("C99887766", "ID"), "client id");
+  assert.ok(has("Anita Sharma", "NAME"), "nominee");
+  assert.ok(has("+91 98765 43210", "PHONE"), "mobile");
+  assert.deepStrictEqual(nameVariants("Ravi Kumar Sharma").sort(),
+    ["Ravi Sharma", "Sharma Ravi", "Sharma Ravi Kumar", "Ravi K Sharma"].sort(), "4 variants");
+  assert.deepStrictEqual(nameVariants("Anita Desai"), ["Desai Anita"], "2-word name");
+  assert.deepStrictEqual(nameVariants("Solo"), [], "single word: no variants");
+  // trusted values hide bare occurrences + variants + widened family names
+  {
+    const r = new Redactor();
+    await r.learn([text]);
+    assert.ok(!r.apply("Ravi Sharma called").includes("Ravi Sharma"), "FIRST LAST variant");
+    assert.ok(!r.apply("Sharma Ravi called").includes("Sharma"), "LAST FIRST variant");
+    assert.ok(!r.apply("Ravi K Sharma called").includes("Ravi K Sharma"), "initial variant");
+    assert.ok(!r.apply("Anita Sharma is the nominee").includes("Anita Sharma"), "nominee trusted");
+    assert.ok(!r.apply("Karan Sharma signed").includes("Karan Sharma"), "surname widening");
+    assert.ok(!r.apply("Flat 12, Lotus Society residents").includes("Flat 12"), "address line trusted");
+  }
+}
+// --- step-7 family first names (invented data) ---
+{
+  const r = new Redactor();
+  await r.learn(["Name: Ravi Kumar Sharma", "ANITA RAVI SHARMA visited the branch"]);
+  assert.ok(!r.apply("ANITA came alone").includes("ANITA"), "family first name hides alone");
+  assert.ok(!r.apply("RAVI called").includes("RAVI"), "middle name hides alone");
+  assert.strictEqual(r.apply("anita came"), "anita came", "lowercase stays (capital-only match)");
+  // common words and surnames are never learned as given names
+  const r2 = new Redactor();
+  await r2.learn(["Name: Ravi Kumar Sharma", "MUMBAI SHARMA branch", "SHARMA SHARMA noted"]);
+  assert.strictEqual(r2.apply("MUMBAI branch open"), "MUMBAI branch open", "place word stays");
 }
 // --- OCR word->box mapping (js/ocr.js pure functions, no worker needed) ---
 {

@@ -11,6 +11,21 @@ const MONTHS =
 
 const digitCount = (s) => s.replace(/\D/g, "").length;
 
+// Luhn check for Emirates IDs (15 digits starting 784).
+const luhnOk = (digits) => {
+  let sum = 0, dbl = false;
+  for (let i = digits.length - 1; i >= 0; i--) {
+    let d = +digits[i];
+    if (dbl) {
+      d *= 2;
+      if (d > 9) d -= 9;
+    }
+    sum += d;
+    dbl = !dbl;
+  }
+  return digits.length > 0 && sum % 10 === 0;
+};
+
 // WHY shared: a 15-18 digit number after ref/reference/txn/... is an order/
 // transaction reference, not a bank account. Checked with only the 20 chars
 // before the match so labelled "account no ..." numbers still hide.
@@ -74,6 +89,26 @@ export const RULES = [
     // WHY the second clause: alphanumeric ids such as MS-A06F5B-E7 carry few
     // digits but are still account references when labelled.
     accept: (m) => hasEnoughDigits(m) || (m.length >= 6 && /\d/.test(m) && /[A-Z]/i.test(m)),
+  },
+  // Label-anchored IDs with loose separators (step 8): the label decides the
+  // type; only the digits hide. `X?` covers prefixed numbers ("X987654321").
+  {
+    type: "POLICY",
+    group: 1,
+    re: /\bpolicy(?:\s*(?:no|number|num))?[\s:.#\-]*X?(\d{6,})\b/gid,
+    accept: (m) => digitCount(m) >= 6,
+  },
+  {
+    type: "ID",
+    group: 1,
+    re: /\b(?:cust(?:omer)?(?:\s*(?:id|no|number))|customer(?:\s*(?:id|no|number))|client(?:\s*(?:id|code|no))|cif(?:\s*no)?|premise(?:\s*(?:no|number))|consumer(?:\s*(?:no|number))|contract(?:\s*(?:no|number))|uid(?:\s*no)?|member(?:\s*(?:id|no)))[\s:.#\-]*X?(\d{6,})\b/gid,
+    accept: (m) => digitCount(m) >= 6,
+  },
+  // Emirates ID: 784 + 4 + 7 + 1 digits with digit boundaries, Luhn-checked.
+  {
+    type: "ID",
+    re: /(?<!\d)784[- ]?\d{4}[- ]?\d{7}[- ]?\d(?!\d)/g,
+    accept: (m) => luhnOk(m.replace(/\D/g, "")),
   },
   // WHY silent guard: broker/depository reference numbers are not accounts.
   // 15-18 digit numbers cued within 20 chars by ref/reference/txn/… stay

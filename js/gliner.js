@@ -1,15 +1,16 @@
-// Zero-shot GLiNER (small v2.1, int8) with custom PII labels: one pass per
-// window finds person + address together. Several workers each hold their own
-// session; recognize() hands a window to whichever worker is free.
-export const LABELS = ["person", "address"];
-// Plain message shown when the 183 MB weights were never downloaded (they are
-// git-ignored: GitHub rejects files over 100 MB). app.js surfaces this while
-// still redacting with the pattern layer.
+// Zero-shot GLiNER PII (Knowledgator pii-small, token-level, ModernBERT
+// encoder) with custom PII labels: one pass per window asks for all labels
+// together. Several workers each hold their own session; recognize() hands a
+// window to whichever worker is free.
+export const LABELS = ["person", "address", "PAN number", "folio number", "phone number", "email", "customer id", "bank account number", "passport number"];
+// Plain message shown when the 83 MB weights were never downloaded (they stay
+// git-ignored to keep the repo light). app.js surfaces this while still
+// redacting with the pattern layer.
 export const MODEL_MISSING_MSG =
   "AI model not downloaded: run tools/fetch-model.sh (or tools/fetch-model.ps1 on Windows)";
 
 const MODEL_URL = new URL(
-  "../vendor/gliner/models/onnx-community/gliner_small-v2.1/onnx/model_quantized.onnx",
+  "../vendor/gliner/models/knowledgator/gliner-pii-small-v1.0/onnx/model_quint8.onnx",
   import.meta.url,
 ).href;
 
@@ -57,7 +58,7 @@ export async function loadGliner() {
   const release = (w) => (waiting.length ? waiting.shift()(w) : idle.push(w));
   return {
     size,
-    async recognize(text, threshold = 0.3) {
+    async recognize(text, threshold = 0.4) {
       const w = await acquire();
       const id = nextId++;
       try {

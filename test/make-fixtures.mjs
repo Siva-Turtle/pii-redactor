@@ -92,6 +92,19 @@ writeFileSync(dir + "finance.txt", [
   "NIFTY closed at 22000 and the mutual fund returned 12 percent; the tax filing deadline is next week.",
 ].join("\n"));
 
+// ---- batch pair: A labels a name/ID, B repeats them bare (step-5 e2e) ----
+writeFileSync(dir + "batch-a.txt", [
+  "Client Name: Anita Desai",
+  "Folio Number 99887766",
+  "Contact anita.desai@example.com, +91 98765 43210.",
+  "The quarterly tax filing deadline is next week.",
+].join("\n"));
+writeFileSync(dir + "batch-b.txt", [
+  "Anita Desai visited the branch on Monday.",
+  "Reference 99887766 was quoted at the counter.",
+  "Mail anita.desai@example.com about the tax filing.",
+].join("\n"));
+
 // ---- edge cases
 {
   const W2 = 'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"';

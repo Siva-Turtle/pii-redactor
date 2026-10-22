@@ -14,8 +14,7 @@ other website.
 | Your computer | Do this |
 |---|---|
 | **Windows** | Download the ZIP → right-click → *Extract All* → double-click **`Start-Windows.bat`** |
-| **Mac** | Download the ZIP → double-click it → right-click **`Start-Mac.command`** → *Open* (first time only) |
-| **Linux** | Extract, then run `./start-linux.sh` |
+| **Mac / Linux** | Extract, then run `./serve.sh` (`Start-Mac.command` / `start-linux.sh` just run it) |
 
 A browser tab opens. Then:
 
@@ -34,8 +33,10 @@ machines; the start file tells you if it is missing). Windows needs nothing extr
 
 ## First-time setup: download the model
 
-The name/address finder needs a 183 MB model file that is **not** in the
-download (GitHub rejects files over 100 MB). Fetch it once with:
+The name/address finder needs a 83 MB model file that is **not** in the
+download (kept out to keep the repo light). First run downloads it once
+automatically (~83 MB, from Hugging Face, SHA-256 checked). Or fetch it
+manually once with:
 
 | Your computer | Command (run inside the extracted folder) |
 |---|---|
@@ -56,28 +57,40 @@ Two layers work together, and both are local:
 
 1. **Pattern layer** (`js/patterns.js`, grown from the CRM's `backend/utils/piiMasking.js`). Exact formats:
    **PAN, Aadhaar, phone, email**, UPI IDs, GSTIN, TAN, IFSC, NSDL demat IDs (`IN300123 10234567`),
-   voter ID, credit/debit cards (incl. Amex), US SSN, 15–18-digit account numbers, IP addresses, and dates.
+   voter ID, credit/debit cards (incl. Amex), US SSN, 15–18-digit account numbers, IP addresses, Emirates IDs
+   (Luhn-checked), and dates.
    Dates are always hidden (birth dates double as passwords on Form 16s and statements).
    **Labelled values** are caught by their label, whatever their format: `a/c`, `account no`, `savings`,
    `loan`, `cheque`, `routing`, `demat`, `DP ID`, `client ID`, `folio`, `policy`, `PRAN`, `UAN`, `CKYC`,
-   `passport`, `Aadhaar`, `SSN`, `card`, and `password / PIN / OTP / CVV is …`.
-2. **AI layer** (`js/gliner.js`, `js/gliner-worker.js`) — [GLiNER small v2.1](https://huggingface.co/onnx-community/gliner_small-v2.1),
-    a purpose-built NER model (183 MB, int8) running locally via WebAssembly.
+   `passport`, `Aadhaar`, `SSN`, `card`, loose `premise/consumer/contract/member/uid/client-code/cif/policy`
+   numbers, and `password / PIN / OTP / CVV is …`.
+   A **number guard** keeps amounts visible: money-formatted or money-labelled digit runs stay readable
+   (nearest label wins: an ID word nearer than a money word still hides).
+2. **AI layer** (`js/gliner.js`, `js/gliner-worker.js`) — [GLiNER PII small v1.0](https://huggingface.co/knowledgator/gliner-pii-small-v1.0),
+    a purpose-built PII model (83 MB, int8, ModernBERT encoder) running locally via WebAssembly.
     Text is scanned in windows of ~300 characters with **one call per window
-    asking for person + address together**. It finds what patterns cannot: a
+    asking for person, address, PAN/folio/phone/email/customer-id/account/passport together**. It finds what patterns cannot: a
     name in prose, an address.
     - **Exact grounding.** An answer is accepted only if it appears in the window; the text actually stored is the
       document's own spelling, so find-and-replace works. Hits are additionally filtered by shape and score
-      (addresses at 0.25; two-word names at 0.2 with a capitalisation check; single-word names at 0.45), and
+      (threshold 0.4 for all labels; model-hit filter drops generic labels, amounts, dates, ISINs), and
       statement vocabulary (stock names, amounts, dates) is never treated as a name.
     - Everything found is then hidden **everywhere** in that file. Cheap deterministic name cues also work with the
       AI off: `Mr./Dr. X`, `Dear X`, `Regards, X`, `spouse X`, `Name: X`.
     - **Speed:** GLiNER runs in one worker per half CPU core (up to 4), each holding its own model session.
-      Measured: ~1 min for a 27-page PDF. The AI pass is
+      Measured: ~0.2 s per window (~5 windows/s with 4 workers on the test machine). The AI pass is
     time-boxed to 10 minutes per file, and you are told in the status line if it ran out. Windows with no
-    capitalised word worth checking are skipped without calling the model.
+    capitalised word, digit run or @ worth checking are skipped without calling the model.
 3. **Spreadsheets/CSV:** columns whose header says *name, email, phone, DOB, address, PAN, Aadhaar, account,
    demat, folio, policy, password…* are hidden whole; other cells go through the two layers above.
+4. **Batch-wide (one client's bundle):** the files you drop together are learned as one bundle in two passes
+   (`Reading file 2 of 5…`, then `Hiding PII in file 2 of 5…`): every string any layer hid in any file is
+   searched for in every file. ID-like terms (4+ digits or @) always carry over; other terms only with
+   agreement (hidden in ≥30% of the places they appear), so one-off model slips do not spread. A
+   **statement-header layer** (`js/statement-header.js`) trusts the investor block (holder name, address
+   lines, email, mobile, PAN, folios, client/BO IDs, nominees) with name variants and surname widening for
+   family names; **address blocks, end-of-line PIN codes, IDs from file names, OCR misreadings and cut-off
+   bank-narration names** are covered too. Security/fund names near an ISIN stay visible.
 
 | File | What you get back |
 |---|---|
@@ -107,7 +120,8 @@ CSV columns: `file, location, page, type, quote, found_by, detail` (UTF-8 with B
 with `= + - @` (or tab/CR) get a leading apostrophe so Excel can't run them as formulas. `found_by` is one of
 `script` (pattern rule in `detail`), `script: name cue` (e.g. “Dear X”), `script: column header` (header text in
 `detail`), `you` (your manual-list entry in `detail`), `gliner` (GLiNER label/score in `detail`,
-e.g. `person, score 0.85`; the first window that found a term is recorded, then the term is hidden everywhere).
+e.g. `person, score 0.85`; the first window that found a term is recorded, then the term is hidden everywhere),
+`script: batch` (term carried over from another file of the same batch; `detail` names the original layer).
 
 Locations by file type (Word files don't store page numbers, so no pages are invented):
 
@@ -142,8 +156,8 @@ is never saved, sent, logged or kept: it lives only until the file is processed,
   addresses (organisations are *not* hidden), and it is **not guaranteed** to catch everything —
   unusual names, all-caps lists, or cluttered text can slip through. Fixed-format finance IDs rely on the pattern layer, which is exact.
 - Patterns are exact; the AI is probabilistic. Treat the output as a strong first pass, then skim it.
-- **Scanned PDFs / pictures** (no selectable text) can't be read. PDFs like this are rejected with a message
-  rather than returned unredacted. Text inside images embedded in Word/PDF files is not read.
+- **Scanned PDFs / pictures** (no selectable text) are read with offline OCR (`vendor/tesseract`,
+  `js/ocr.js`). It works offline but is slower and may miss faint text — review the output.
 - **Over-redaction is deliberate**: long digit runs and dates are hidden even when harmless, and a name is hidden
   wherever it appears.
 - The AI pass is time-boxed (10 minutes per file); beyond that the patterns still cover the whole file and you
@@ -162,15 +176,15 @@ your org. The site contains no data — files only ever stay in each person's br
 index.html        UI (single page, locked-down CSP)
 js/patterns.js    regex layer → spans
 js/redactor.js    combines layers; learns names once per file, applies everywhere
-js/gliner.js      GLiNER sessions (person + address in one call per window), grounding-checked
+js/gliner.js      GLiNER sessions (all PII labels in one call per window), grounding-checked
 js/handlers.js    one handler per file type
 js/csv.js         exact-fidelity CSV parser/writer
 js/notice.js      closing LLM notice appended to every redacted file
 vendor/           everything the page loads (pdf.js, SheetJS, JSZip, pdf-lib, GLiNER engine + wasm)
-models/           GLiNER tokenizer/config files (the 183 MB onnx weights live under vendor/gliner/…,
-                  git-ignored — fetch with tools/fetch-model.sh or .ps1, see "First-time setup")
+models/           GLiNER tokenizer/config files (the 83 MB onnx weights live under vendor/gliner/…,
+                   git-ignored — fetch with tools/fetch-model.sh or .ps1, see "First-time setup")
 serve.py/.ps1/.sh tiny localhost servers behind the Start-* files
-tools/fetch-model.sh (.ps1 on Windows)   download + SHA-256-check the 183 MB model (no npm needed)
+tools/fetch-model.sh (.ps1 on Windows)   download + SHA-256-check the 83 MB model (no npm needed)
 tools/update-vendor.sh   re-fetch vendor/ (calls fetch-model.sh for the weights)
 ```
 

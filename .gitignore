@@ -2,7 +2,7 @@ tools/node_modules/
 test/out/
 test/fixtures/
 .DS_Store
-# GLiNER onnx weights (183 MB) exceed GitHub's 100 MB file limit: fetched on
-# demand via tools/fetch-model.sh (.ps1 on Windows). Only this one file is
+# GLiNER onnx weights (83 MB) stay git-ignored to keep the repo light: fetched
+# on demand via tools/fetch-model.sh (.ps1 on Windows). Only this one file is
 # ignored; the tokenizer/config files stay tracked.
-vendor/gliner/models/onnx-community/gliner_small-v2.1/onnx/model_quantized.onnx
+vendor/gliner/models/knowledgator/gliner-pii-small-v1.0/onnx/model_quint8.onnx

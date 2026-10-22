@@ -1,5 +1,5 @@
 import { loadGliner as loadDetector, MODEL_MISSING_MSG } from "./gliner.js";
-import { Redactor, buildReportCsv, formatFound } from "./redactor.js";
+import { Redactor, buildReportCsv, computeGlobals, deriveAddressParts, fileNameIds, formatFound } from "./redactor.js";
 import { SUPPORTED, extOf, redactFile, detectLock, NeedsPasswordError } from "./handlers.js";
 
 // Fixed pipeline settings (the Options panel was removed from the UI; these
@@ -82,7 +82,7 @@ function addRow(file) {
     <div class="top"><span class="fname"></span><span class="chip" data-state="waiting">Waiting</span></div>
     <form class="pw" hidden>
       <label></label>
-      <input type="text" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" data-lpignore="true" data-1p-ignore>
+      <input type="password" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" data-lpignore="true" data-1p-ignore>
       <div class="pwerr" hidden></div>
     </form>`;
   li.querySelector(".fname").textContent = file.name;
@@ -152,58 +152,102 @@ function getDetector() {
   return detectorPromise;
 }
 
-async function processFile(file, row, index, total, password = "") {
-  row.status = "working";
-  row.pwError = "";
-  renderRow(row);
-  setBar(0.02);
-  try {
-    let detector = null;
-    if (AI_ON) {
-      setStatus(`Working on file ${index + 1} of ${total} (${file.name}): getting the AI ready (first time only)…`);
-      detector = await getDetector();
-      // WHY regex-only fallback: a missing/failed AI must never block
-      // redaction; the pattern layer still covers the whole file.
-      if (aiFailed) {
-        setStatus(aiError.includes(MODEL_MISSING_MSG)
-          ? `${MODEL_MISSING_MSG}. Continuing file ${index + 1} of ${total} (${file.name}) with pattern checks only…`
-          : `The name-finding AI could not start in this browser, so only the pattern checks (emails, phone numbers, IDs, dates) were used. Continuing file ${index + 1} of ${total} (${file.name})…`);
-      }
-    }
-    const redactor = new Redactor({ dates: HIDE_DATES, thorough: THOROUGH_ON, manual: MANUAL_ITEMS, detector });
-    const status = (text) => {
-      setStatus(`${index + 1} of ${total} files processing... ${text}`);
-      const m = text.match(/(\d+) of (\d+)/);
-      if (m) setBar(0.05 + 0.9 * (+m[1] / +m[2]));
-    };
-    const out = await redactFile(file, redactor, status, { password, onlyUnlock: ONLY_UNLOCK });
-    // WHY stored in memory only: reports hold the original sensitive text, so
-    // they are never saved, never sent anywhere, and never zipped.
-    results.push({ name: out.name, blob: out.blob, report: out.report || [], fileName: file.name });
-    row.report = out.report || [];
-    row.warnings = out.warnings || [];
-    row.total = redactor.total;
-    row.status = "done";
-    row.locked = false;
+/**
+ * Step-5 batch flow. Pass 1 opens every unlocked file and learns from ALL of
+ * it (cues, patterns, AI with a shared per-window cache, statement headers);
+ * pass 2 redacts each file with the batch-wide terms. One file alone learns
+ * and redacts exactly as before (agreement is trivially satisfied).
+ */
+async function processBatch(entries, detector) {
+  const aiCache = new Map();
+  const pass1 = []; // {row, file, password, report, warnings, texts}
+  // ---- pass 1: read + learn from everything ("Reading file 2 of 5…").
+  // A per-file failure marks only that row; the rest of the batch continues.
+  for (let i = 0; i < entries.length; i++) {
+    const { row, file, password } = entries[i];
+    row.status = "working";
+    row.pwError = "";
     renderRow(row);
-  } catch (err) {
-    if (err instanceof NeedsPasswordError) {
-      row.status = "needs-pw";
-      row.locked = true;
+    setStatus(`Reading file ${i + 1} of ${entries.length} (${file.name})…`);
+    setBar(0.02 + 0.44 * (i / Math.max(1, entries.length)));
+    const redactor = new Redactor({ dates: HIDE_DATES, thorough: THOROUGH_ON, manual: MANUAL_ITEMS, detector, aiCache });
+    try {
+      const out = await redactFile(file, redactor, () => {}, { password, onlyUnlock: ONLY_UNLOCK });
+      // WHY output discarded: pass 1 only gathers learn texts + hidden-string
+      // flags for the agreement check; the real redaction happens in pass 2.
+      pass1.push({ row, file, password, report: out.report || [], warnings: out.warnings || [], texts: [...redactor.batchTexts] });
+    } catch (err) {
+      if (err instanceof NeedsPasswordError || err?.code === "wrong-password") {
+        row.status = "needs-pw";
+        row.locked = true;
+        if (err?.code === "wrong-password") row.pwError = "That password didn't work. Check it and try again.";
+      } else {
+        console.error(err);
+        row.status = "error";
+        row.failMessage = err?.message || String(err);
+      }
       renderRow(row);
-      return;
     }
-    if (err.code === "wrong-password" && password) {
-      // Only this row errors; the typed password stays so it is easy to retry.
-      row.status = "needs-pw";
-      row.locked = true;
-      row.pwError = "That password didn't work. Check it and try again.";
-      renderRow(row);
-      return;
+  }
+  if (!pass1.length) return;
+  // ---- agreement: every hidden string is a candidate; ID-like terms always
+  // go on, others only at >=30% of appearances. Address parts join as quotes.
+  const batchTexts = new Set();
+  for (const p of pass1) for (const t of p.texts) batchTexts.add(t);
+  const allQuotes = pass1.flatMap((p) => p.report);
+  const parts = deriveAddressParts(allQuotes).map((x) => ({ quote: x.text, type: x.type, source: "address-part" }));
+  const globals = computeGlobals(batchTexts, [...allQuotes, ...parts]);
+  // WHY file names: people name files by account/policy no, so 6–15 digit
+  // runs from every uploaded name hide batch-wide (not date timestamps).
+  const nameIds = new Set();
+  for (const p of pass1) for (const d of fileNameIds(p.file.name)) nameIds.add(d);
+  // ---- pass 2: hide PII in each file ("Hiding PII in file 2 of 5…")
+  for (let i = 0; i < pass1.length; i++) {
+    const { row, file, password, warnings: w1 } = pass1[i];
+    setStatus(`Hiding PII in file ${i + 1} of ${pass1.length} (${file.name})…`);
+    setBar(0.5 + 0.48 * (i / Math.max(1, pass1.length)));
+    const redactor = new Redactor({ dates: HIDE_DATES, thorough: THOROUGH_ON, manual: MANUAL_ITEMS, detector, aiCache });
+    try {
+    // WHY pre-learn the batch: cues/patterns/headers from the other files
+      // apply here too; AI windows hit the pass-1 cache, never re-running.
+      await redactor.learn([...batchTexts], {});
+      const seen = new Set();
+      for (const g of globals) {
+        redactor.addGlobal(g.text, g.type, g.prov);
+        seen.add(`${g.type}:${g.text.toLowerCase()}`);
+      }
+      // WHY trusted direct: statement-header values (+variants) skip the
+      // agreement check and are searched batch-wide too. File-name IDs join
+      // the same way (always ID-like, so the gate would pass them anyway).
+      for (const v of redactor.trusted.values()) {
+        if (seen.has(`${v.type}:${v.text.toLowerCase()}`)) continue;
+        seen.add(`${v.type}:${v.text.toLowerCase()}`);
+        redactor.addGlobal(v.text, v.type, { source: "header", trusted: true });
+      }
+      for (const d of nameIds) {
+        if (seen.has(`ID:${d.toLowerCase()}`)) continue;
+        seen.add(`ID:${d.toLowerCase()}`);
+        redactor.addGlobal(d, "ID", { source: "filename" });
+      }
+      const status = (text) => {
+        const m = String(text).match(/(\d+) of (\d+)/);
+        if (m) setBar(0.5 + 0.48 * ((+m[1] - 1 + i) / Math.max(1, pass1.length)));
+      };
+      const out = await redactFile(file, redactor, status, { password, onlyUnlock: ONLY_UNLOCK, keepKnowledge: true });
+      // WHY stored in memory only: reports hold the original sensitive text, so
+      // they are never saved, never sent anywhere, and never zipped.
+      results.push({ name: out.name, blob: out.blob, report: out.report || [], fileName: file.name });
+      row.report = out.report || [];
+      // WHY deduped: pass 1 and pass 2 surface the same per-file warnings.
+      row.warnings = [...new Set([...w1, ...(out.warnings || [])])];
+      row.total = redactor.total;
+      row.status = "done";
+      row.locked = false;
+    } catch (err) {
+      console.error(err);
+      row.status = "error";
+      row.failMessage = err?.message || String(err);
     }
-    console.error(err);
-    row.status = "error";
-    row.failMessage = err.message || String(err);
     renderRow(row);
   }
 }
@@ -285,11 +329,21 @@ async function processOnce() {
       renderRow(row);
     }
   }
-  let n = 0;
+  // Step-5 batch: one detector for the run, then pass 1 (read+learn from
+  // everything) and pass 2 (redact each file with the batch-wide terms).
+  let detector = null;
+  if (AI_ON && jobs.length) {
+    setStatus(`Getting the AI ready (first time only)…`);
+    detector = await getDetector();
+    if (aiFailed) {
+      setStatus(aiError.includes(MODEL_MISSING_MSG)
+        ? `${MODEL_MISSING_MSG}. Continuing with pattern checks only…`
+        : `The name-finding AI could not start in this browser, so only the pattern checks (emails, phone numbers, IDs, dates) were used. Continuing…`);
+    }
+  }
+  const entries = jobs.map((job) => ({ row: job.row, file: job.row.file, password: job.password || "" }));
+  await processBatch(entries, detector);
   for (const job of jobs) {
-    n++;
-    const index = rows.indexOf(job.row);
-    await processFile(job.row.file, job.row, index, total, job.password || "");
     // A password is never kept: clear the box once the file is done.
     if (job.row.status === "done") {
       job.row.el.querySelector(".pw input").value = "";

@@ -34,24 +34,54 @@ REV=2ae11323dc000f5e70c49f7403efa6af12ba9e67
 SHA=c9d915eca282ed42d1a09b143b592adb4cc6744ffe2d294adf5cfc5548170c38
 curl -fL -o $V/model/needle3.cact "https://huggingface.co/Cactus-Compute/needle3/resolve/$REV/needle3.cact"
 echo "$SHA  $V/model/needle3.cact" | sha256sum -c -
-# GLiNER NER (zero-shot person/address): bundle npm `gliner` 0.0.19 (MIT) and
-# copy the onnxruntime-web 1.19.2 (MIT) single-thread wasm files it loads.
-mkdir -p $V/gliner $V/gliner/models/onnx-community/gliner_small-v2.1/onnx ../models/onnx-community/gliner_small-v2.1
+# GLiNER PII (zero-shot, Knowledgator pii-small token-level, ModernBERT
+# encoder): bundle npm `gliner` 0.0.19 (MIT) and copy the onnxruntime-web
+# 1.19.2 (MIT) single-thread wasm files it loads.
+mkdir -p $V/gliner $V/gliner/models/knowledgator/gliner-pii-small-v1.0/onnx ../models/knowledgator/gliner-pii-small-v1.0
 npx esbuild $N/gliner/dist/index.mjs --bundle --format=esm --minify --outfile=$V/gliner/gliner.bundle.js
 cp $N/onnxruntime-web/dist/ort-wasm-simd-threaded.mjs $N/onnxruntime-web/dist/ort-wasm-simd-threaded.wasm $V/gliner/
-# Model + tokenizer: onnx-community/gliner_small-v2.1 (Apache-2.0). The onnx
+# Model + tokenizer: knowledgator/gliner-pii-small-v1.0 (Apache-2.0). The onnx
 # file lives under vendor/ (explicit modelPath in js/gliner-worker.js); the
 # tokenizer files are ALSO copied to top-level /models/ (transformers.js
 # default localModelPath, resolved from tokenizerPath
-# "onnx-community/gliner_small-v2.1").
-HF="https://huggingface.co/onnx-community/gliner_small-v2.1/resolve/main"
-for f in config.json gliner_config.json tokenizer.json tokenizer_config.json added_tokens.json special_tokens_map.json; do
-  curl -fL -o $V/gliner/models/onnx-community/gliner_small-v2.1/$f "$HF/$f"
-  cp $V/gliner/models/onnx-community/gliner_small-v2.1/$f ../models/onnx-community/gliner_small-v2.1/$f
+# "knowledgator/gliner-pii-small-v1.0").
+HF="https://huggingface.co/knowledgator/gliner-pii-small-v1.0/resolve/main"
+for f in gliner_config.json tokenizer.json tokenizer_config.json special_tokens_map.json; do
+  curl -fL -o $V/gliner/models/knowledgator/gliner-pii-small-v1.0/$f "$HF/$f"
+  cp $V/gliner/models/knowledgator/gliner-pii-small-v1.0/$f ../models/knowledgator/gliner-pii-small-v1.0/$f
 done
-# The 183 MB onnx weights are NOT committed (GitHub's 100 MB file limit);
+# The 83 MB onnx weights are NOT committed (keeps the repo light);
 # fetch-model.sh downloads them with a SHA-256 check (skips when present).
 bash fetch-model.sh
+# Compatibility fixes for the vendored GLiNER.js 0.0.19 stack (both verified
+# in-browser; without them the model loads but returns noise):
+# 1. tokenizer.json ships BPE merges as arrays (["Ġ","Ġ"]); the bundled
+#    transformers 2.17.2 BPE loader calls .split on each entry, so rewrite
+#    them to the old "a b" string form (lossless, re-applied on refresh).
+# 2. the bundle hardcodes BOS id 1 (DeBERTa's [CLS]); this tokenizer's CLS is
+#    50281 and transformers 2.17.2 exposes no cls_token_id, so derive it from
+#    encode("[CLS]") instead (falls back to 1 for other models).
+PYBIN=python3; command -v python3 >/dev/null 2>&1 || PYBIN=python
+$PYBIN - <<'EOF'
+import io, json
+for p in ["../vendor/gliner/models/knowledgator/gliner-pii-small-v1.0/tokenizer.json",
+          "../models/knowledgator/gliner-pii-small-v1.0/tokenizer.json"]:
+    t = json.load(io.open(p, encoding="utf-8"))
+    m = t["model"]["merges"]
+    if m and isinstance(m[0], list):
+        t["model"]["merges"] = [" ".join(pair) for pair in m]
+        io.open(p, "w", encoding="utf-8").write(json.dumps(t, ensure_ascii=False))
+        print("merges converted:", p)
+b = "../vendor/gliner/gliner.bundle.js"
+s = io.open(b, encoding="utf-8").read()
+old = "i=[0],c=[1],u=[1],d=1"
+new = 'i=[0],c=[this.tokenizer.cls_token_id??this.tokenizer.encode("[CLS]").slice(1,-1)[0]??1],u=[1],d=1'
+if old in s:
+    io.open(b, "w", encoding="utf-8").write(s.replace(old, new))
+    print("BOS patched:", b)
+elif new not in s:
+    raise SystemExit("bundle BOS pattern not found; check gliner.bundle.js")
+EOF
 # English OCR data (tessdata_fast, Apache-2.0). Pinned checksum: the file
 # lives on a moving branch, so a mismatch fails loudly for a maintainer to
 # re-pin instead of silently vendoring new bytes.
