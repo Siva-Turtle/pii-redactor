@@ -82,7 +82,7 @@ function addRow(file) {
     <div class="top"><span class="fname"></span><span class="chip" data-state="waiting">Waiting</span></div>
     <form class="pw" hidden>
       <label></label>
-      <input type="password" autocomplete="off">
+      <input type="text" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" data-lpignore="true" data-1p-ignore>
       <div class="pwerr" hidden></div>
     </form>`;
   li.querySelector(".fname").textContent = file.name;

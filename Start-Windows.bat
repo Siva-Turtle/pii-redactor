@@ -8,7 +8,7 @@ echo.
 REM One-time 183 MB model download (skipped when already present, so this
 REM stays offline-friendly). The app still works without it (patterns only).
 if not exist "%~dp0vendor\gliner\models\onnx-community\gliner_small-v2.1\onnx\model_quantized.onnx" (
-  echo   AI model not found, downloading it now (one time, ~183 MB)...
+  echo   AI model not found, downloading it now - one time, ~183 MB...
   powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0tools\fetch-model.ps1"
   if errorlevel 1 echo   Could not download the AI model. Continuing with pattern checks only.
   echo.

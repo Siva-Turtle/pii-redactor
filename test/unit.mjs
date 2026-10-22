@@ -1,6 +1,7 @@
 // Run with: node test/unit.mjs
 import assert from "node:assert";
 import { existsSync, readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { findPatternSpans, applySpans } from "../js/patterns.js";
 import { Redactor, chunkText, cleanHit, parseManual } from "../js/redactor.js";
 import { parseCsv, stringifyCsv } from "../js/csv.js";
@@ -375,7 +376,7 @@ assert.strictEqual(cleanHit("Dr Priya Nair."), "Priya Nair");
   assert.strictEqual(detectOfficeEncryption(oleVer(9, 9), "docx"), "unknown");
 
   // Real fixtures (written by test/make-fixtures.mjs); skipped when absent.
-  const fx = (n) => new URL(`./fixtures/${n}`, import.meta.url).pathname;
+  const fx = (n) => fileURLToPath(new URL(`./fixtures/${n}`, import.meta.url));
   if (existsSync(fx("locked.docx")) && existsSync(fx("locked-src.docx"))) {
     for (const [enc, src, ext] of [["locked.docx", "locked-src.docx", "docx"], ["locked.xlsx", "locked-src.xlsx", "xlsx"]]) {
       const bytes = new Uint8Array(readFileSync(fx(enc)));

@@ -2,8 +2,6 @@
 # One-time setup: repo Settings -> Pages -> Source: "GitHub Actions".
 name: Deploy to GitHub Pages
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
 permissions:
   contents: read

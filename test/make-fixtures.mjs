@@ -5,10 +5,12 @@
 // to *generate* fixtures, never at runtime (the page stays dependency-free).
 import { createRequire } from "node:module";
 import { execFileSync } from "node:child_process";
-import { writeFileSync } from "node:fs";
+import { mkdirSync, writeFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 const require = createRequire(new URL("../tools/", import.meta.url).href + "x.js");
 const JSZip = require("jszip"), XLSX = require("xlsx"), { PDFDocument, StandardFonts } = require("pdf-lib");
-const dir = new URL("./fixtures/", import.meta.url).pathname;
+const dir = fileURLToPath(new URL("./fixtures/", import.meta.url));
+mkdirSync(dir, { recursive: true });
 
 const lines = [
   "Dear Mr. Rajesh Kumar Sharma,",
