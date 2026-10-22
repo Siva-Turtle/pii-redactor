@@ -75,9 +75,11 @@ const ROLE_RE =
 const ID_CUE_WORDS = ["folio", "account", "a/c", "acct", "client", "customer", "cust", "id", "number", "no", "ref", "member", "policy", "crn", "ucc", "dp", "bo", "demat", "iban", "card", "pran", "uan"];
 // Money words (shared with the step-3 number guard): a label carrying one
 // means the nearby number is an amount. invest*/tax* are prefixes; the rest
-// are whole words (so "emi" never matches inside "PREMISE").
+// are whole words (so "emi" never matches inside "PREMISE"). Asset, savings,
+// outstanding and liability words are amounts in table rows/headers too (a
+// pure number under "Outstanding" or beside "Home Loan" stays visible).
 const MONEY_WORDS_RE =
-  /\b(?:amount|amt|balance|value|valuation|payments?|price|nav|units?|cost|loan|income|salary|expenses?|premium|corpus|total|invest\w*|gains?|loss(?:es)?|tax\w*|emi|rent|fees?|charges|interest|inr|aed|usd|rs|sgd|eur|gbp)\b/i;
+  /\b(?:amount|amt|balance|value|valuation|payments?|price|nav|units?|cost|loan|income|salary|expenses?|premium|corpus|total|invest\w*|gains?|loss(?:es)?|tax\w*|emi|rent|fees?|charges|interest|assets?|savings?|outstanding|liabilit(?:y|ies)|inr|aed|usd|rs|sgd|eur|gbp)\b/i;
 const MONEY_SYMBOL_RE = /[₹$€£]/;
 const wordRe = (w) => new RegExp(`(?<![A-Za-z])${w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?![A-Za-z])`, "i");
 const ID_CUE_RES = ID_CUE_WORDS.map(wordRe);
@@ -93,7 +95,9 @@ export function hasMoneyWord(text) {
 /**
  * Label + column-header context for a hit inside `working` (shared by the
  * step-2 digits rule and the step-3 number guard). Non-tabbed lines: the last
- * 40 chars before the hit. Tabbed rows: the previous cell. Header: the same
+ * 40 chars before the hit. Tabbed rows: the previous cell plus the row's
+ * first cell (a pure number in a money row stays visible even in column 3+,
+ * where the previous cell is just another number). Header: the same
  * column's cell in the block's first tab line.
  */
 export function labelAndHeader(working, hit) {
@@ -101,9 +105,9 @@ export function labelAndHeader(working, hit) {
   try {
     m = new RegExp(wsRe(hit), "i").exec(working || "");
   } catch {
-    return { label: "", header: "" };
+    return { label: "", header: "", first: "" };
   }
-  if (!m) return { label: "", header: "" };
+  if (!m) return { label: "", header: "", first: "" };
   return labelAndHeaderAt(working || "", m.index, m.index + m[0].length);
 }
 
@@ -114,7 +118,7 @@ export function labelAndHeaderAt(text, start, end) {
   if (lineEnd < 0) lineEnd = text.length;
   const line = text.slice(lineStart, lineEnd);
   const at = start - lineStart;
-  if (!line.includes("\t")) return { label: line.slice(Math.max(0, at - 40), at), header: "" };
+  if (!line.includes("\t")) return { label: line.slice(Math.max(0, at - 40), at), header: "", first: "" };
   const cells = line.split("\t");
   let acc = 0, ci = 0;
   for (let i = 0; i < cells.length; i++) {
@@ -124,6 +128,7 @@ export function labelAndHeaderAt(text, start, end) {
   }
   const cellStart = acc;
   const label = ci > 0 ? cells[ci - 1] : cells[ci].slice(0, Math.max(0, at - cellStart));
+  const first = (cells[0] || "").trim();
   // Block header: first tab line of the contiguous tab-line run above.
   let top = lineStart;
   for (;;) {
@@ -135,9 +140,9 @@ export function labelAndHeaderAt(text, start, end) {
     top = prevStart;
   }
   const firstEnd = text.indexOf("\n", top);
-  const first = text.slice(top, firstEnd < 0 ? text.length : firstEnd);
-  const header = (first.split("\t")[ci] || "").trim();
-  return { label: label || "", header: header === label ? "" : header };
+  const firstLine = text.slice(top, firstEnd < 0 ? text.length : firstEnd);
+  const header = (firstLine.split("\t")[ci] || "").trim();
+  return { label: label || "", header: header === label ? "" : header, first: first === label ? "" : first };
 }
 
 // --- Step 3: number guard (keep amounts visible). Digits-only spans from the
@@ -162,14 +167,21 @@ export function isAmountVisible(text, start, end) {
   const t = raw.trim();
   if (/^[₹$]/.test(t)) return true; // leading ₹/$
   if (MONEY_FMT_RE.test(t) || MONEY_DEC_RE.test(t)) return true;
-  const { label, header } = labelAndHeaderAt(text, start, end);
+  const { label, header, first } = labelAndHeaderAt(text, start, end);
+  // WHY table fast path: a pure number cell (optionally ".0"/decimals) in a
+  // money row (first cell carries a money word) or under a money header
+  // (Value/Amount/Outstanding/Balance/Payment/EMI) is an amount. The previous
+  // cell alone is not enough: in column 3+ it is just another number.
+  if (/^\d+(?:\.\d+)?$/.test(t)) {
+    if (hasMoneyWord(first || "") || hasMoneyWord(header || "")) return true;
+  }
   const decide = (ctx) => {
     const idLast = lastMatchPos(ID_CUE_GLOBAL, ctx);
     const moneyLast = Math.max(lastMatchPos(MONEY_GLOBAL, ctx), lastSymbolPos(ctx));
     if (idLast < 0 && moneyLast < 0) return null; // no cue here
     return idLast <= moneyLast; // ID strictly after money hides; else visible
   };
-  return decide(label) ?? decide(header) ?? false;
+  return decide(label) ?? decide(header) ?? decide(first || "") ?? false;
 }
 /** Digits with optional ₹/$, spaces, commas/decimals (no letters, no +/-/@). */
 export function isDigitsOnlyText(s) {
@@ -209,8 +221,15 @@ export function isFilteredModelHit(hit, kind, working) {
   // so it stays hidable for ID/ACCOUNT even without a same-line cue unless
   // a money word sits next to it (the amount guard still owns those).
   if (/^\d[\d\s./-]*$/.test(n)) {
-    const { label, header } = labelAndHeader(working || "", hit);
-    const cue = `${label || ""} ${header || ""}`;
+    const { label, header, first } = labelAndHeader(working || "", hit);
+    // WHY first cell too: in column 3+ the previous cell is another number;
+    // the row's first cell ("Home Loan") and the header ("Outstanding") own
+    // the amount context, so they join the ID/money cue check.
+    const cue = `${label || ""} ${header || ""} ${first || ""}`;
+    // WHY table fast path: a pure number (optionally ".0") in a money row or
+    // under a money header is an amount even when 8+ digits (the carve-out
+    // below would otherwise keep it as an ID).
+    if (/^\d+(?:\.\d+)?$/.test(n) && (hasMoneyWord(first || "") || hasMoneyWord(header || ""))) return true;
     if (!(hasIdWord(cue) && !hasMoneyWord(cue))) {
       const pureDigits = n.replace(/\D/g, "");
       const plainRun = /^[\d\s]*$/.test(n) && pureDigits.length >= 8;
@@ -278,6 +297,39 @@ export function isCurrencyCode(s) {
 }
 
 /**
+ * Generic-label gate for every layer that learns or emits spans. True when
+ * the text holds no digits/@ and every letter-token is a stop, generic,
+ * ID-cue, money, address or role word ("Number", "Registered Address",
+ * "Policy Number", "Non Promoter", "Within India", "Holdings"). Such spans
+ * (from any source except explicit pattern IDs like email/PAN/phone, which
+ * always carry @/digits) must never be emitted or learned; a real address
+ * carrying other tokens ("12 Registered Office Lane, Pune") still passes.
+ * Exported for tests.
+ */
+export function isGenericLabelText(s) {
+  const raw = String(s || "").trim();
+  if (!raw) return true;
+  if (/[\d@]/.test(raw)) return false;
+  const words = raw
+    .split(/[\s\-–—]+/)
+    .map((w) => w.replace(/^[^A-Za-z]+|[^A-Za-z]+$/g, ""))
+    .filter(Boolean);
+  if (!words.length) return true;
+  const isLabelToken = (w) => {
+    const c = String(w || "").replace(/[^A-Za-z]/g, "");
+    if (!c) return true;
+    if (isCommonWord(c)) return true;
+    if (hasIdWord(c)) return true;
+    if (hasMoneyWord(c)) return true;
+    if (ROLE_QUALIFIERS.has(c.toLowerCase())) return true;
+    if (hasAddressWord(c)) return true;
+    if (isCurrencyCode(c)) return true;
+    return false;
+  };
+  return words.every(isLabelToken);
+}
+
+/**
  * Shared gate for every newline-split model piece. True = the piece may be
  * learned or emitted; false = drop it (never merge into neighbours).
  * WHY one helper: _learnGliner and spans() must apply exactly the same gates
@@ -301,6 +353,11 @@ export function passesModelPieceGate(piece, kind, working, text = null, start = 
   // WHY currency first: a code alone ("INR", "Rs", "₹") is a unit, never PII,
   // whatever the model called it.
   if (isCurrencyCode(hit)) return false;
+  // WHY every kind: a span of only generic/label words ("Registered Address",
+  // "Policy Number", "Holdings", "Non Promoter") is a heading, never PII,
+  // whether the model called it a person, address or ID. Digits/@ never count
+  // as generic, so real addresses and IDs still pass.
+  if (isGenericLabelText(hit)) return false;
   let genericCheck = hit;
   if (kind === "NAME" || kind === "ADDRESS") {
     // WHY currency never names: a header label ("Market Value (INR)") the
@@ -359,7 +416,7 @@ export function passesModelPieceGate(piece, kind, working, text = null, start = 
         let idCued = false;
         try {
           const ctx = labelAndHeaderAt(String(text || ""), start, end);
-          idCued = hasIdWord(`${ctx.label || ""} ${ctx.header || ""}`);
+          idCued = hasIdWord(`${ctx.label || ""} ${ctx.header || ""} ${ctx.first || ""}`);
         } catch {
           idCued = false;
         }
@@ -716,6 +773,10 @@ export function computeGlobals(batchTexts, quotes) {
     if (f.type === "NAME" && CURRENCY_TOKEN_RE.test(f.text)) continue;
     // WHY shared gate: a generic cue/header slip must never become batch-wide.
     if (f.type === "NAME" && isGenericNameTerm(f.text)) continue;
+    // WHY every type: a heading of only generic/label words ("Registered
+    // Address", "Policy Number", "Holdings") is never PII, whatever label the
+    // model gave it. Digits/@ never count as generic, so real IDs pass.
+    if (isGenericLabelText(f.text)) continue;
     const digitsOnly = /^\d+$/.test(f.text.replace(/\s+/g, ""));
     if (digitsOnly && f.text.replace(/\D/g, "").length < 6) continue;
     // WHY plain numbers stay local: a pure <=7-digit run the model quoted
@@ -728,6 +789,7 @@ export function computeGlobals(batchTexts, quotes) {
     if (f.prov?.trusted) {
       // Trusted header values skip agreement but never skip the generic gate.
       if (f.type === "NAME" && isGenericNameTerm(f.text)) continue;
+      if (isGenericLabelText(f.text)) continue;
       out.push({ text: f.text, type: f.type, prov: f.prov });
       continue;
     }
@@ -960,6 +1022,7 @@ export class Redactor {
     if (!t) return;
     // WHY shared gate: a bad term must never become batch-wide.
     if (type === "NAME" && isGenericNameTerm(t)) return;
+    if (isGenericLabelText(t)) return;
     if (isCurrencyCode(t)) return;
     if (type === "NAME" && CURRENCY_TOKEN_RE.test(t)) return;
     // WHY plain numbers stay local: a pure <=7-digit model quote with no ID
@@ -1181,11 +1244,13 @@ export class Redactor {
     for (const h of found) {
       // WHY shared gate: a generic header value must never become trusted.
       if (h.type === "NAME" && isGenericNameTerm(h.value)) continue;
+      if (isGenericLabelText(h.value)) continue;
       const key = normKey(h.value);
       if (!this.trusted.has(key)) this.trusted.set(key, { text: h.value, type: h.type, variant: false });
       if (h.type === "NAME") {
         for (const v of nameVariants(h.value)) {
           if (isGenericNameTerm(v)) continue;
+          if (isGenericLabelText(v)) continue;
           const k = normKey(v);
           if (!this.trusted.has(k)) this.trusted.set(k, { text: v, type: "NAME", variant: true });
         }
@@ -1257,10 +1322,12 @@ export class Redactor {
       if (parts.length < 2 || parts.length > 4) continue;
       if (parts.some((p) => p.replace(/[^A-Za-z]/g, "").length < 2)) continue;
       if (isGenericNameTerm(cand)) continue;
+      if (isGenericLabelText(cand)) continue;
       const key = normKey(cand);
       if (!this.trusted.has(key)) this.trusted.set(key, { text: cand, type: "NAME", variant: false });
       for (const v of nameVariants(cand)) {
         if (isGenericNameTerm(v)) continue;
+        if (isGenericLabelText(v)) continue;
         const k = normKey(v);
         if (!this.trusted.has(k)) this.trusted.set(k, { text: v, type: "NAME", variant: true });
       }
@@ -1291,6 +1358,7 @@ export class Redactor {
           if (!hasIdWord(`${t} ${lines[j - 1] || ""}`)) continue;
         } else if (hasMoneyWord(t) && !hasIdWord(t)) continue;
         if (hasAddressWord(t) || /\d/.test(t)) {
+          if (isGenericLabelText(t)) continue;
           const key = normKey(t);
           if (!this.trusted.has(key)) this.trusted.set(key, { text: t, type: "ADDRESS" });
           continue;
@@ -1298,6 +1366,7 @@ export class Redactor {
         if (looksLikeLocalityLine(t)) {
           const words = t.split(/\s+/).map((w) => w.replace(/[^A-Za-z]/g, "")).filter(Boolean);
           if (words.length && words.every(isCommonWord)) continue;
+          if (isGenericLabelText(t)) continue;
           const key = normKey(t);
           if (!this.trusted.has(key)) this.trusted.set(key, { text: t, type: "ADDRESS" });
           continue;
@@ -1888,6 +1957,9 @@ export class Redactor {
     // carrying one is a header label, not a person.
     if (isCurrencyCode(term)) return;
     if ((kind === "NAME" || kind === "ADDRESS") && CURRENCY_TOKEN_RE.test(term)) return;
+    // WHY every kind: a heading of only generic/label words never learns,
+    // whatever the model called it. Digits/@ never count, so real IDs pass.
+    if (isGenericLabelText(term)) return;
     // WHY shared gate: every cue/label/model NAME funnels through here.
     if (kind === "NAME" && !/\d/.test(term) && isGenericNameTerm(term)) return;
     const key = normKey(term);
@@ -2122,6 +2194,21 @@ export class Redactor {
         const s = spans[i];
         if (s.source !== "gliner" && s.source !== "needle" && s.source !== "cue") continue;
         if (this._isSecurityName(text.slice(s.start, s.end))) spans.splice(i, 1);
+      }
+    }
+    // WHY every source: a span of only generic/label words is a heading, never
+    // PII, wherever it was learned (model, cue, global, trusted, union, PIN).
+    // Explicit pattern IDs (email/PAN/phone, which always carry @/digits) and
+    // the user's own list still win.
+    for (let i = spans.length - 1; i >= 0; i--) {
+      const s = spans[i];
+      if (s.source === "you") continue;
+      if (s.source === "script" && !s.trusted) continue;
+      if (s.source === "column") continue;
+      try {
+        if (isGenericLabelText(text.slice(s.start, s.end))) spans.splice(i, 1);
+      } catch {
+        /* a bad slice must never break redaction */
       }
     }
     spans.sort((a, b) => a.start - b.start);

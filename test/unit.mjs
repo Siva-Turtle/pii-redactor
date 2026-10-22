@@ -1279,4 +1279,89 @@ assert.strictEqual(cleanHit("Dr Priya Nair."), "Priya Nair");
   assert.deepStrictEqual(buildOcrPage([]), { text: "", ranges: [] });
   assert.deepStrictEqual(scaleBox({ x0: 10, y0: 20, x1: 30, y1: 40 }, 0.5), { x0: 5, y0: 10, x1: 15, y1: 20 });
 }
+// --- tab-table amounts stay visible (invented data; 2-file batch, fake detector) ---
+{
+  const { isGenericLabelText } = await import("../js/redactor.js");
+  const docA = "Liabilities\tOutstanding\tMonthly Payment\nHome Loan\t2306000\t9150\nCar Loan\t41000\t3100";
+  const docB = "Asset\tValue\nSavings Account Balance\t730000.0\nBank FD / RD\t5200000.0";
+  // fake GLiNER: tries to hide every pure number as an ID
+  const det = {
+    size: 1,
+    recognize: async (w) => {
+      const out = [];
+      for (const m of String(w || "").matchAll(/(?<!\d)\d[\d,.]*(?!\d)/g)) out.push({ label: "customer id", word: m[0], score: 0.9 });
+      return out;
+    },
+  };
+  const batchApplyB = async (fileA, fileB) => {
+    const r = new Redactor({ detector: det });
+    await r.learn([fileA, fileB]);
+    return r.apply(fileB);
+  };
+  assert.strictEqual(await batchApplyB(docA, docB), docB, "asset table amounts stay");
+  assert.strictEqual(await batchApplyB(docB, docA), docA, "loan table amounts stay");
+  for (const n of ["2306000", "9150", "41000", "3100"]) assert.ok((await batchApplyB(docB, docA)).includes(n), `${n} visible`);
+  for (const n of ["730000.0", "5200000.0"]) assert.ok((await batchApplyB(docA, docB)).includes(n), `${n} visible`);
+  // learned terms, globals, unions and ID rules never hide them either
+  {
+    const r = new Redactor({ detector: det });
+    await r.learn([docA, docB]);
+    assert.deepStrictEqual([...r.terms.ID, ...r.terms.ACCOUNT].filter((t) => /^\d/.test(t)), [], "no number learned");
+    assert.ok(!r.globals.some((g) => /^\d/.test(g.text)), "no number global");
+    for (const doc of [docA, docB]) assert.deepStrictEqual(r.spans(doc).filter((s) => /\d/.test(doc.slice(s.start, s.end))), [], `no span hides numbers: ${doc.slice(0, 20)}`);
+  }
+  // labelled IDs still hide
+  {
+    const r = new Redactor();
+    await r.learn(["Account No\t123456789012"]);
+    assert.ok(!r.apply("Account No\t123456789012").includes("123456789012"), "labelled ID hides");
+  }
+  void isGenericLabelText;
+}
+// --- generic label words never hide alone (invented data; 2-file batch, fake detector) ---
+{
+  const { isGenericLabelText, computeGlobals } = await import("../js/redactor.js");
+  const { isCommonWord } = await import("../js/common-words.js");
+  for (const w of ["number", "address", "holdings", "rights", "non", "promoter", "within"]) assert.strictEqual(isCommonWord(w), true, `${w} is generic`);
+  assert.strictEqual(isGenericLabelText("Registered Address"), true);
+  assert.strictEqual(isGenericLabelText("Policy Number"), true);
+  assert.strictEqual(isGenericLabelText("12 Registered Office Lane, Pune"), false, "real address passes");
+  const words = ["Number", "number", "NUMBER", "Registered", "registered", "Address", "address", "Holdings", "rights", "Non Promoter", "Within India"];
+  const det = {
+    size: 1,
+    recognize: async (w) => {
+      const out = [];
+      for (const hit of [...words, "Registered Address", "Policy Number"]) if (String(w || "").includes(hit)) out.push({ label: "address", word: hit, score: 0.9 });
+      if (String(w || "").includes("12 Registered Office Lane, Pune")) out.push({ label: "address", word: "12 Registered Office Lane, Pune", score: 0.9 });
+      return out;
+    },
+  };
+  const batchApplyB = async (fileA, fileB) => {
+    const r = new Redactor({ detector: det });
+    await r.learn([fileA, fileB]);
+    return r.apply(fileB);
+  };
+  for (const w of words) {
+    const fileB = `Note ${w} filed here`;
+    assert.strictEqual(await batchApplyB("Intro line one", fileB), fileB, `${w} stays`);
+  }
+  assert.strictEqual(await batchApplyB("Intro", "Heading Registered Address noted"), "Heading Registered Address noted", "heading stays");
+  assert.strictEqual(await batchApplyB("Intro", "Heading Policy Number noted"), "Heading Policy Number noted", "label stays");
+  // never learned nor spread batch-wide
+  {
+    const r = new Redactor({ detector: det });
+    await r.learn(["Note Holdings filed here", "Heading Registered Address noted"]);
+    assert.deepStrictEqual([...r.terms.ADDRESS, ...r.terms.NAME].filter((t) => isGenericLabelText(t)), [], "no generic learned");
+    r.apply("Note Holdings filed here");
+    const g = computeGlobals(new Set(["Note Holdings filed here"]), r.report);
+    assert.ok(!g.some((x) => isGenericLabelText(x.text)), "no generic global");
+  }
+  // real addresses with such words plus other tokens still hide
+  {
+    const r = new Redactor({ detector: det });
+    const doc = "Stay at 12 Registered Office Lane, Pune tonight";
+    await r.learn([doc]);
+    assert.ok(!r.apply(doc).includes("Registered Office Lane"), "real address hides");
+  }
+}
 console.log("All unit tests passed.");

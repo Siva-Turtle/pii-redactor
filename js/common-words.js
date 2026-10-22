@@ -30,6 +30,9 @@ const GENERIC_WORDS = [
   "team", "office", "branch", "bank", "banks", "date", "dates",
   "amount", "amounts", "total", "totals", "note", "notes",
   "statement", "statements", "self", "spouse",
+  "number", "numbers", "address", "addresses",
+  "holding", "holdings", "right", "rights",
+  "non", "promoter", "promoters", "within",
   "inr", "usd", "aed", "eur", "gbp", "sgd", "cad", "aud", "rs",
 ];
 // Country / state / major-city names (public geography, never PII).
