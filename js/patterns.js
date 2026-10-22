@@ -12,8 +12,8 @@ const MONTHS =
 const digitCount = (s) => s.replace(/\D/g, "").length;
 
 // A number/ID value that follows a label, e.g. "a/c 5010 0234 5678", "folio no 1234567/89".
-// Up to 4 letters then a digit, then digits/letters/-/ and up to three more space-separated groups.
-const VALUE = "((?:[A-Z]{0,4}\\d[A-Z0-9/-]*)(?:[ ]\\d[A-Z0-9/-]*){0,3})";
+// Hyphenated alphanumeric ids such as MS-A06F5B-E7 are one value, not separate groups.
+const VALUE = "((?:[A-Z]{1,4}-[A-Z0-9-]*\\d[A-Z0-9-]*|[A-Z]{0,4}\\d[A-Z0-9/-]*)(?:[ ]\\d[A-Z0-9/-]*){0,3})";
 const SEP = "(?:[ \\t]*(?:no\\.?|number|num|id|#))?[ \\t]*[:=\\-\u2013]?[ \\t]*(?:is|was)?[ \\t]*";
 const labelled = (labels) => new RegExp(`\\b(?:${labels})${SEP}${VALUE}`, "gid");
 const hasEnoughDigits = (m) => m.replace(/\D/g, "").length >= 5;
@@ -58,7 +58,9 @@ export const RULES = [
     re: labelled(
       "a\\/c|acct|account|savings|current account|salary account|loan(?: account)?|customer id|cif|cheque|micr|routing|aba|sort code|utr",
     ),
-    accept: hasEnoughDigits,
+    // WHY the second clause: alphanumeric ids such as MS-A06F5B-E7 carry few
+    // digits but are still account references when labelled.
+    accept: (m) => hasEnoughDigits(m) || (m.length >= 6 && /\d/.test(m) && /[A-Z]/i.test(m)),
   },
   // 16-digit card, optionally grouped in 4s; AMEX is 15 (4-6-5). Must precede SSN/AADHAAR/PHONE.
   { type: "CARD", re: /\b(?:\d{4}[ -]?){3}\d{4}\b/g },
@@ -85,9 +87,13 @@ export const RULES = [
       "gi",
     ),
   },
-  // Loosest pattern: optional +country prefix, then 7-14 digits with spaces or
-  // dashes between them. Runs last so it never pre-empts a specific match.
-  { type: "PHONE", re: /(\+?\d[\d\s-]{6,13}\d)/g, accept: (m) => digitCount(m) >= 7 },
+  // Tight phone rules: labelled numbers, 10-digit / US-style / Indian-mobile
+  // with digit/punctuation guards, and +countrycode. The old loose rule (any
+  // 7-14 digits with spaces/dashes) hid quantities and amounts in statement
+  // tables (561 false hits on one 27-page file, 0 real), so it is gone.
+  { type: "PHONE", group: 1, re: labelled("phone|mobile|mob|tel|telephone|contact|whatsapp|cell|fax"), accept: (m) => digitCount(m) >= 7 },
+  { type: "PHONE", re: /(?<![\d.,])(?:\+\d{1,3}[ \t-]?)?(?:\(?\d{3}\)?[ \t-]\d{3}[ \t-]\d{4}|[6-9]\d{4}[ \t-]?\d{5}|\d{10})(?![\d]|[.,]\d)/g, accept: (m) => digitCount(m) >= 10 },
+  { type: "PHONE", re: /(?<![\d.,])\+\d{1,3}[ \t-]?\d[\d \t-]{6,12}\d(?![\d]|[.,]\d)/g, accept: (m) => digitCount(m) >= 8 },
 ];
 
 export function labelFor(type) {

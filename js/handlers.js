@@ -5,6 +5,7 @@
 
 import { parseCsv, stringifyCsv, detectDelimiter } from "./csv.js";
 import { labelFor } from "./patterns.js";
+import { LLM_NOTICE } from "./notice.js";
 import {
   unlockOffice,
   detectOfficeEncryption,
@@ -149,12 +150,14 @@ async function redactText(file, redactor, status, ext) {
   await learnWithBudget(redactor, [text], status, warnings);
   const base = redactor.report.length;
   const out = redactor.apply(text);
+  // Closing notice for any LLM that later reads the file, as real text.
+  const outWithNotice = out.replace(/\s*$/, "") + "\n\n" + LLM_NOTICE + "\n";
   for (let i = base; i < redactor.report.length; i++) {
     const e = redactor.report[i];
     e.location = `line ${e.start != null ? lineOf(text, e.start) : 1}`;
     e.page = "";
   }
-  return { blob: new Blob([out], { type: "text/plain" }), name: outName(file.name, ext), warnings, report: redactor.report.slice() };
+  return { blob: new Blob([outWithNotice], { type: "text/plain" }), name: outName(file.name, ext), warnings, report: redactor.report.slice() };
 }
 
 // --------------------------------------------------------------------- csv
@@ -199,7 +202,7 @@ async function redactCsv(file, redactor, status) {
   const hiddenCols = (rows[headRow] || []).filter((_, c) => hidden[c]);
   if (hiddenCols.length) warnings.push(`Hid whole columns: ${hiddenCols.join(", ")}.`);
   return {
-    blob: new Blob([bom + stringifyCsv(out, delimiter, eol)], { type: "text/csv" }),
+    blob: new Blob([bom + stringifyCsv([...out, [LLM_NOTICE]], delimiter, eol)], { type: "text/csv" }),
     name: outName(file.name, "csv"),
     warnings,
     report: redactor.report.slice(),
@@ -300,6 +303,8 @@ async function redactXlsx(file, redactor, status, opts = {}) {
     }
   }
   wb.Props = {};
+  // Extra sheet carrying the LLM notice as real text.
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet([[LLM_NOTICE]]), "Redaction notice");
   const out = XLSX.write(wb, { bookType: "xlsx", type: "array", cellStyles: true });
   warnings.push("Cell colours and fonts may be simplified in the redacted workbook.");
   return {
@@ -402,13 +407,22 @@ async function redactDocx(file, redactor, status, opts = {}) {
     let paraNo = 0;
     for (const [pEl, els] of byPara.entries()) {
       paraNo++;
+      // WHY <w:br/> counts as "\n": without a separator "a@b.com<w:br/>Next"
+      // joins into one string and the EMAIL rule swallows the next line's
+      // first word. The break element itself is left in place; only the
+      // <w:t> text is rewritten, so write-back stays run-accurate.
       let cursor = 0;
-      const nodes = els.map((el) => {
-        const text = el.textContent;
-        const n = { el, text, start: cursor, end: cursor + text.length };
-        cursor = n.end;
-        return n;
-      });
+      let text = "";
+      const nodes = [];
+      for (const el of pEl.getElementsByTagName("*")) {
+        if (el.nodeName === "w:br") { text += "\n"; cursor += 1; }
+        else if (el.nodeName === "w:t") {
+          const t = el.textContent;
+          nodes.push({ el, text: t, start: cursor, end: cursor + t.length });
+          text += t;
+          cursor += t.length;
+        }
+      }
       const tbl = closest(pEl, "w:tbl");
       let location;
       if (tbl) {
@@ -419,7 +433,7 @@ async function redactDocx(file, redactor, status, opts = {}) {
         location = `${part}, paragraph ${paraNo}`;
       }
       paraLocByEl.set(pEl, location);
-      paragraphs.push({ nodes, text: nodes.map((n) => n.text).join(""), location, pEl, part });
+      paragraphs.push({ nodes, text, location, pEl, part });
     }
   }
 
@@ -472,6 +486,27 @@ async function redactDocx(file, redactor, status, opts = {}) {
       }
     }
     if (changed) zip.file(name, new XMLSerializer().serializeToString(doc));
+  }
+  // Closing notice as the last paragraph of the body (before sectPr), as real text.
+  {
+    const f = zip.file("word/document.xml");
+    if (f) {
+      const d = parser.parseFromString(await f.async("string"), "application/xml");
+      const W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+      const body = d.getElementsByTagNameNS(W, "body")[0];
+      if (body) {
+        const para = d.createElementNS(W, "w:p");
+        const run = d.createElementNS(W, "w:r");
+        const t = d.createElementNS(W, "w:t");
+        t.textContent = LLM_NOTICE;
+        run.appendChild(t);
+        para.appendChild(run);
+        const last = body.lastElementChild;
+        if (last && last.localName === "sectPr") body.insertBefore(para, last);
+        else body.appendChild(para);
+        zip.file("word/document.xml", new XMLSerializer().serializeToString(d));
+      }
+    }
   }
   const strip = async (path, tags) => {
     const f = zip.file(path);
@@ -565,12 +600,12 @@ async function redactPdf(file, redactor, status, opts = {}) {
     warnings.push(`${blank} page(s) have no readable text (pictures only). They were copied as-is, so please check them by eye.`);
 
   if (onlyUnlock) warnings.push("Password removed. Pages are saved as pictures, so the text in this PDF can no longer be selected.");
-  else await learnWithBudget(redactor, pages.map((p) => p.text), status, warnings);
+  else await learnWithBudget(redactor, pages.map((p) => p.text), (t) => status(t.replace(/Looking for names and addresses… (\d+) of (\d+)/, "Scanning $1 of $2 pages...")), warnings);
 
   const measure = document.createElement("canvas").getContext("2d");
   const out = await PDFLib.PDFDocument.create();
   for (let i = 0; i < pages.length; i++) {
-    status(`${onlyUnlock ? "Copying" : "Redacting"} page ${i + 1} of ${pages.length}…`);
+    status(onlyUnlock ? `Copied ${i} of ${pages.length} pages...` : `Removed PIIs from ${i} of ${pages.length} pages...`);
     const { page, text } = pages[i];
     const unit = page.getViewport({ scale: 1 });
     const scale = Math.min(2, Math.sqrt(16_000_000 / (unit.width * unit.height)));
@@ -630,6 +665,25 @@ async function redactPdf(file, redactor, status, opts = {}) {
     pdfPage.drawImage(img, { x: 0, y: 0, width: unit.width, height: unit.height });
     page.cleanup();
   }
+  // Closing page with the notice as real, selectable text. Skipped when the
+  // file is only being unlocked, not redacted.
+  if (!onlyUnlock && pages.length) {
+    const last = pages[pages.length - 1].page.getViewport({ scale: 1 });
+    const font = await out.embedFont(PDFLib.StandardFonts.Helvetica);
+    const notePage = out.addPage([last.width, last.height]);
+    const size = 11, maxW = last.width - 100;
+    let line = "", y = last.height - 60;
+    for (const word of LLM_NOTICE.split(" ")) {
+      const next = line ? line + " " + word : word;
+      if (font.widthOfTextAtSize(next, size) > maxW) {
+        notePage.drawText(line, { x: 50, y, size, font });
+        y -= size * 1.5;
+        line = word;
+      } else line = next;
+    }
+    if (line) notePage.drawText(line, { x: 50, y, size, font });
+  }
+  status(onlyUnlock ? `Copied ${pages.length} of ${pages.length} pages...` : `Removed PIIs from ${pages.length} of ${pages.length} pages...`);
   if (!onlyUnlock) warnings.push("Pages are saved as pictures with black boxes, so the text in this PDF can no longer be selected.");
   const name = onlyUnlock ? file.name : outName(file.name, "pdf");
   if (onlyUnlock) {

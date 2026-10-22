@@ -1,18 +1,19 @@
 // Combines the two redaction layers behind one small API:
 //
-//   const r = new Redactor({ dates: true, detector });   // detector optional (Needle)
+//   const r = new Redactor({ dates: false, detector });  // detector optional (GLiNER)
 //   await r.learn(allTextsInTheFile, onProgress);        // AI pass: discover names/addresses
 //   r.spans(text)  -> [{start,end,type,source,...}]      // where PII sits in `text`
 //   r.apply(text)  -> "…[NAME]…"                         // replaced text (also counts it)
 //
-// Layer 1 (patterns.js) finds fixed-format identifiers. Layer 2 (Needle, via
-// `detector`) discovers names, addresses and other PII; each one found is then redacted
-// EVERYWHERE it occurs in the file, not only in the chunk that revealed it.
+// Layer 1 (patterns.js) finds fixed-format identifiers. Layer 2 (GLiNER, via
+// `detector`) discovers names and addresses; each one found is then redacted
+// EVERYWHERE it occurs in the file, not only in the window that revealed it.
 //
 // Provenance: every span carries where it was found so the per-file
 // `redactor.report` can list the exact original quote, its type and who found
 // it. Sources: "script" (regex rule), "cue" (deterministic name cue),
-// "needle" (Cactus Needle model), "you" (user's manual list),
+// "gliner" (GLiNER model), "needle" (legacy Cactus Needle path, kept for
+// tests), "you" (user's manual list),
 // "column" (whole spreadsheet/CSV column hidden by its header).
 
 import { NOT_A_SECRET, applySpans, findPatternSpans, labelFor } from "./patterns.js";
@@ -21,6 +22,16 @@ import { NOT_A_SECRET, applySpans, findPatternSpans, labelFor } from "./patterns
 // split per sentence/line; only tiny neighbouring fragments are merged.
 const CHUNK_MAX = 200;
 const CHUNK_MERGE = 30;
+// GLiNER scores one ~300-char window per call for person + address together.
+// Thresholds: addresses at 0.25; two-word names at 0.2 (the capitalisation
+// shape filter does the precision work); single-word names at 0.45.
+const GLINER_WINDOW = 300;
+const GLINER_MIN = 0.25;
+const GLINER_MIN_NAME = 0.2;
+const GLINER_MIN_SINGLE = 0.45;
+// Statement vocabulary and share-plan words that GLiNER mistakes for
+// people/places; keeps stock names, dates and amounts readable.
+const GLINER_NOT_PII = /\b(?:GSUs?|RSUs?|Vest(?:ed|ing)?|Page|Grant|Tax|IRS|Alien|Nonresident|Account|Summary|Total|Release|Plan|Share|Savings|Stock|Price|Value|Activity|Balance|Dividend|Inc|Alphabet|Google|Class|NASDAQ)\b|^[A-Z]{2,6}$|\d{1,2}-[A-Z][a-z]{2}-\d{4}/;
 const MAX_RUNS = 12; // hard cap on Needle runs per chunk
 const EMPTY_RUNS_TO_STOP = 2; // stop after this many consecutive runs that find nothing new
 // Words that merely open a sentence; a capital letter on them says nothing.
@@ -51,6 +62,9 @@ export function cleanHit(hit) {
   return h.replace(/[\s,;:.]+$/, "");
 }
 
+// Amounts, currency values and percentages are never PII; the 9+ digit carve-out
+// keeps long digit strings (account-like) eligible for the ID path below.
+const MONEY = /^[\s(\-+]*(?:(?:US|A|C|S|HK)?\$|USD|INR|Rs\.?|₹|€|£|¥)?\s*[\d,]+(?:\.\d+)?\s*(?:%|USD|INR|CR|DR|cr|dr|[KMB]n?)?[\s)]*$/;
 const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 const wsRe = (s) => escapeRe(s).replace(/\s+/g, "\\s+");
 const normKey = (s) => s.replace(/\s+/g, " ").trim().toLowerCase();
@@ -122,6 +136,7 @@ export function provToFoundBy(s) {
   if (src === "cue") return { found_by: "script: name cue", detail: s.cue || "" };
   if (src === "column") return { found_by: "script: column header", detail: s.header || "" };
   if (src === "you") return { found_by: "you", detail: s.entry || "" };
+  if (src === "gliner") return { found_by: "gliner", detail: `${s.label}, score ${s.score}` };
   if (src === "needle") {
     const q = s.question === "pii" ? "find_pii" : (s.question || "");
     return { found_by: "needle", detail: `${q}, run ${s.run ?? ""}, variant ${s.variant ?? ""}`.trim() };
@@ -193,6 +208,9 @@ export class Redactor {
   async learn(texts, { onProgress, maxChunks = Infinity, maxMs = Infinity } = {}) {
     for (const t of texts) if (t) this._learnCues(t);
     if (!this.detector) return { scanned: 0, total: 0, truncated: false };
+    // GLiNER detectors expose recognize(); anything else is the legacy
+    // per-question Needle path kept for tests.
+    if (this.detector.recognize) return this._learnGliner(texts, { onProgress, maxChunks, maxMs });
     // The model is local, so it sees the original text: placeholders such as
     // "[EMAIL]" or "X" measurably confuse it. Pattern hits are masked only to
     // decide whether a chunk is worth asking about.
@@ -212,6 +230,46 @@ export class Redactor {
         await this._scanChunk(list[next++]);
         done++;
         onProgress?.(done, total);
+      }
+    };
+    await Promise.all(Array.from({ length: Math.max(1, Math.min(this.detector.size || 1, total)) }, lane));
+    return { scanned: done, total: list.length, truncated: done < list.length };
+  }
+
+  /** GLiNER pass. One call per ~300-char window asks for person + address together. */
+  async _learnGliner(texts, { onProgress, maxChunks = Infinity, maxMs = Infinity }) {
+    const wins = new Map();
+    for (const t of texts) {
+      if (!t) continue;
+      let cur = "";
+      for (const l of t.split(/\n+/).map((x) => x.trim()).filter(Boolean)) {
+        if (cur && cur.length + l.length > GLINER_WINDOW) { wins.set(cur, true); cur = ""; }
+        cur = cur ? cur + "\n" + l : l;
+      }
+      if (cur) wins.set(cur, true);
+    }
+    // A window with no capitalised word outside the statement vocabulary
+    // cannot hold a name or address, so the model never needs to see it.
+    const STATEMENT_WORDS = /^(?:Outstanding|Distributed|Forfeited|Accumulated|Unvested|Currently|Processing|Deposit|Starting|From|Name|Date|Description|Quantity|Amount|Cost|Basis|Gain|Loss|Sale|Sold|Purchase|Transaction|Holdings|Position|Market|Closing|Opening|Period|Company|Number|Summary|Future|Available|Remainder|After|Change|History|Currencies|Dollars|United|States|Specified|Unless|All)$/;
+    const hasCandidate = (w) => (w.match(/\p{Lu}\p{L}{2,}/gu) || []).some((x) => !GLINER_NOT_PII.test(x) && !STATEMENT_WORDS.test(x));
+    const list = [...wins.keys()].filter((w) => /\p{L}{3,}/u.test(w) && hasCandidate(w));
+    const total = Math.min(list.length, maxChunks);
+    const started = Date.now();
+    let done = 0;
+    let next = 0;
+    const lane = async () => {
+      while (next < total && Date.now() - started < maxMs) {
+        const w = list[next++];
+        for (const e of await this.detector.recognize(w, GLINER_MIN)) {
+          const kind = e.label === "person" ? "NAME" : e.label === "address" ? "ADDRESS" : null;
+          if (!kind || e.score < (kind === "NAME" ? (e.word.trim().includes(" ") ? GLINER_MIN_NAME : GLINER_MIN_SINGLE) : GLINER_MIN)) continue;
+          const raw = e.word.replace(/\s+/g, " ").trim();
+          if (GLINER_NOT_PII.test(raw) || /^(?:RB|C)?[0-9A-F]{6,}$/i.test(raw) || !/\p{L}{3,}/u.test(raw)) continue;
+          if (kind === "NAME" && !raw.split(" ").every((x) => /^\p{Lu}[\p{L}'.-]*$/u.test(x))) continue;
+          const found = this._accept(raw, kind, w.replace(/\n/g, " "));
+          if (found) this._addTerm(found.term, found.kind, { source: "gliner", label: e.label, score: +e.score.toFixed(2) });
+        }
+        onProgress?.(++done, total);
       }
     };
     await Promise.all(Array.from({ length: Math.max(1, Math.min(this.detector.size || 1, total)) }, lane));
@@ -309,6 +367,10 @@ export class Redactor {
    */
   _accept(raw, kind, working) {
     let hit = cleanHit(raw);
+    // Amounts, currency values and company/ticker strings are never PII; the
+    // 9+ digit carve-out keeps long digit strings eligible for the ID path.
+    if (MONEY.test(hit) && !/^\d{9,}$/.test(hit.replace(/[\s,]/g, ""))) return null;
+    if (CORPORATE.test(hit) || /^[A-Z]{1,5}$/.test(hit)) return null;
     if (kind === "PII") {
       kind = inferKind(hit);
       if (!kind) return null;

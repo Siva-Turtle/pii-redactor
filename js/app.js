@@ -1,14 +1,15 @@
-import { loadDetector } from "./ai.js";
+import { loadGliner as loadDetector, MODEL_MISSING_MSG } from "./gliner.js";
 import { Redactor, buildReportCsv, formatFound } from "./redactor.js";
 import { SUPPORTED, extOf, redactFile, detectLock, NeedsPasswordError } from "./handlers.js";
 
 // Fixed pipeline settings (the Options panel was removed from the UI; these
-// constants replace it: AI on, thorough check always on, dates hidden, no
-// manual list, onlyUnlock off). `?noai=1` is a test-only hook so the e2e can
-// exercise the fast pattern-only path; the page offers no AI toggle.
+// constants replace it: AI on, thorough check always on, dates not hidden
+// (dates are not PII for this tool), no manual list, onlyUnlock off).
+// `?noai=1` is a test-only hook so the e2e can exercise the fast
+// pattern-only path; the page offers no AI toggle.
 const AI_ON = !new URLSearchParams(location.search).has("noai");
 const THOROUGH_ON = true;
-const HIDE_DATES = true;
+const HIDE_DATES = false;
 const MANUAL_ITEMS = [];
 const ONLY_UNLOCK = false;
 
@@ -25,6 +26,7 @@ let results = []; // { name, blob, report, fileName } for finished files
 let detectorPromise = null;
 let reportUrl = null;
 let aiFailed = false;
+let aiError = "";
 
 const plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
 
@@ -112,6 +114,7 @@ function setFiles(list) {
   files = [...list];
   results = [];
   aiFailed = false;
+  aiError = "";
   rows = files.map((f) => addRow(f));
   $("files").replaceChildren(...rows.map((r) => r.el));
   const label = document.querySelector("#pickField .pick-label");
@@ -142,6 +145,7 @@ function getDetector() {
     detectorPromise = loadDetector().catch((err) => {
       console.error(err);
       aiFailed = true;
+      aiError = err && err.message ? err.message : String(err);
       return null;
     });
   }
@@ -158,11 +162,17 @@ async function processFile(file, row, index, total, password = "") {
     if (AI_ON) {
       setStatus(`Working on file ${index + 1} of ${total} (${file.name}): getting the AI ready (first time only)…`);
       detector = await getDetector();
-      if (aiFailed) setStatus(`The name-finding AI could not start in this browser, so only the pattern checks (emails, phone numbers, IDs, dates) were used. Continuing file ${index + 1} of ${total} (${file.name})…`);
+      // WHY regex-only fallback: a missing/failed AI must never block
+      // redaction; the pattern layer still covers the whole file.
+      if (aiFailed) {
+        setStatus(aiError.includes(MODEL_MISSING_MSG)
+          ? `${MODEL_MISSING_MSG}. Continuing file ${index + 1} of ${total} (${file.name}) with pattern checks only…`
+          : `The name-finding AI could not start in this browser, so only the pattern checks (emails, phone numbers, IDs, dates) were used. Continuing file ${index + 1} of ${total} (${file.name})…`);
+      }
     }
     const redactor = new Redactor({ dates: HIDE_DATES, thorough: THOROUGH_ON, manual: MANUAL_ITEMS, detector });
     const status = (text) => {
-      setStatus(`Working on file ${index + 1} of ${total} (${file.name}): ${text}`);
+      setStatus(`${index + 1} of ${total} files processing... ${text}`);
       const m = text.match(/(\d+) of (\d+)/);
       if (m) setBar(0.05 + 0.9 * (+m[1] / +m[2]));
     };
@@ -325,7 +335,9 @@ function finishRun() {
   if (parts.length) setStatus(parts.join(" "));
   // Per-file warnings that used to sit on cards live here now, as short lines.
   const warns = [];
-  if (aiFailed) warns.push("The name-finding AI could not start, so only the pattern checks (emails, phone numbers, IDs, dates) were used.");
+  if (aiFailed) warns.push(aiError.includes(MODEL_MISSING_MSG)
+    ? `${MODEL_MISSING_MSG}. Only the pattern checks (emails, phone numbers, IDs, dates) were used.`
+    : "The name-finding AI could not start, so only the pattern checks (emails, phone numbers, IDs, dates) were used.");
   for (const r of done) for (const w of r.warnings || []) warns.push(`${r.file.name}: ${w}`);
   setWarnings(warns);
 }

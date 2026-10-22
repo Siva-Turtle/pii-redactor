@@ -2,8 +2,12 @@
 
 | Component | Use | License |
 |---|---|---|
-| [Cactus Needle 3](https://huggingface.co/Cactus-Compute/needle3) weights + WASM engine | finds names and addresses | Apache-2.0 |
+| [Cactus Needle 3](https://huggingface.co/Cactus-Compute/needle3) weights + WASM engine | legacy name/address finder (kept for tests; the page now uses GLiNER) | Apache-2.0 |
 | [cactus-needle](https://github.com/afshinm/cactus-needle) (browser wrapper, community package) | loads Needle in a Web Worker | Apache-2.0 |
+| [GLiNER small v2.1](https://huggingface.co/onnx-community/gliner_small-v2.1) (`vendor/gliner/models/.../onnx/model_quantized.onnx`, tokenizer in `vendor/gliner/models/...` and `/models/...`) | zero-shot person/address finder | Apache-2.0 |
+| [gliner](https://github.com/Ingvarstep/GLiNER.js) 0.0.19 (`vendor/gliner/gliner.bundle.js`, esbuilt from npm) | GLiNER inference engine in a Web Worker | MIT |
+| [onnxruntime-web](https://github.com/microsoft/onnxruntime) 1.19.2 (`vendor/gliner/ort-wasm-simd-threaded.mjs/.wasm`) | runs the GLiNER model (single-thread wasm) | MIT |
+| [deberta-v3-small](https://huggingface.co/microsoft/deberta-v3-small) tokenizer + model config (via the GLiNER model files above) | subword tokenisation for GLiNER | MIT |
 | [pdf.js](https://github.com/mozilla/pdf.js) | reads PDF text and draws pages | Apache-2.0 |
 | [pdf-lib](https://github.com/Hopding/pdf-lib) | writes the redacted PDF | MIT |
 | [JSZip](https://github.com/Stuk/jszip) | opens/saves .docx and builds the ZIP download | MIT (dual-licensed MIT/GPLv3) |

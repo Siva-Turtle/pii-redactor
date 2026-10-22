@@ -28,10 +28,14 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - uses: actions/checkout@v4
+      # The 183 MB GLiNER weights are git-ignored (GitHub's 100 MB push
+      # limit), so fetch them into the working tree before assembling.
+      - name: Fetch AI model
+        run: bash tools/fetch-model.sh
       - name: Assemble site
         run: |
           mkdir _site
-          cp -r index.html js vendor _site/
+          cp -r index.html js vendor models _site/
       - uses: actions/upload-pages-artifact@v3
         with: { path: _site }
       - id: deployment

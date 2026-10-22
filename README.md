@@ -32,6 +32,21 @@ A browser tab opens. Then:
 Keep the black start-up window open while you work; close it to stop. Mac/Linux need Python 3 (already on most
 machines; the start file tells you if it is missing). Windows needs nothing extra.
 
+## First-time setup: download the model
+
+The name/address finder needs a 183 MB model file that is **not** in the
+download (GitHub rejects files over 100 MB). Fetch it once with:
+
+| Your computer | Command (run inside the extracted folder) |
+|---|---|
+| **Windows** (PowerShell) | `powershell -ExecutionPolicy Bypass -File tools\fetch-model.ps1` |
+| **Mac / Linux** | `bash tools/fetch-model.sh` |
+
+It downloads from Hugging Face and checks the SHA-256. The Start files below
+run the same check automatically when the model is missing, and stay offline
+once it is there. Without the model the app still works but only the pattern
+checks run, and it tells you so.
+
 > **Always glance over the result before sharing it.** No automatic tool catches everything — see
 > "What it can and cannot do".
 
@@ -46,26 +61,21 @@ Two layers work together, and both are local:
    **Labelled values** are caught by their label, whatever their format: `a/c`, `account no`, `savings`,
    `loan`, `cheque`, `routing`, `demat`, `DP ID`, `client ID`, `folio`, `policy`, `PRAN`, `UAN`, `CKYC`,
    `passport`, `Aadhaar`, `SSN`, `card`, and `password / PIN / OTP / CVV is …`.
-2. **AI layer** (`js/ai.js`) — [Cactus Needle 3](https://cactuscompute.com/needle), a ~35 MB model running via
-   WebAssembly. For every sentence it is asked narrow questions (only the relevant ones): *person name*,
-   *address*, *bank / demat / folio / policy / loan number*, *government or tax ID*, *password / PIN / OTP /
-   username*, plus a catch-all **`find_pii`** ("any other personal or sensitive detail") that must **return the
-   exact quote as written in the document**. It finds what patterns cannot: an unlabelled `LIC/0034/998877`, a
-   plain-word password, a name in prose, an address.
-   - **Ask until sure.** Each sentence is re-checked in a loop that only stops after **two consecutive runs find
-     nothing new** (hard cap: 12 runs). Needle is deterministic, so asking the same question twice would just repeat
-     the answer; consecutive runs therefore use two *different phrasings* of each question, and whatever a run found
-     is blanked out of the text before the next run, so it can surface anything the earlier runs were hiding behind.
-   - **Exact quotes only.** An answer is accepted only if it appears in the sentence; the text actually stored is the
-     document's own spelling, so find-and-replace works. Answers from the catch-all are additionally typed by shape
-     and dropped unless convincing (names must be Capitalised words, numbers must contain digits, whole sentences or
-     lowercase phrases are ignored).
-   - Everything found is then hidden **everywhere** in that file. Cheap deterministic name cues also work with the
-     AI off: `Mr./Dr. X`, `Dear X`, `Regards, X`, `spouse X`, `Name: X`.
-   - **Speed:** Needle runs in one worker per CPU core (up to 6), and every question for every sentence is
-   queued across them. Measured: asking N questions at once costs the same as asking one, so the finance sample
-   (12 lines, 81 model calls) takes ~33 s on a 4-core machine, down from 137 s with two workers. The AI pass is
-   time-boxed to 10 minutes per file, and you are told in the status line if it ran out. Sentences with nothing worth asking about (no names, digits or `@`) are skipped.
+2. **AI layer** (`js/gliner.js`, `js/gliner-worker.js`) — [GLiNER small v2.1](https://huggingface.co/onnx-community/gliner_small-v2.1),
+    a purpose-built NER model (183 MB, int8) running locally via WebAssembly.
+    Text is scanned in windows of ~300 characters with **one call per window
+    asking for person + address together**. It finds what patterns cannot: a
+    name in prose, an address.
+    - **Exact grounding.** An answer is accepted only if it appears in the window; the text actually stored is the
+      document's own spelling, so find-and-replace works. Hits are additionally filtered by shape and score
+      (addresses at 0.25; two-word names at 0.2 with a capitalisation check; single-word names at 0.45), and
+      statement vocabulary (stock names, amounts, dates) is never treated as a name.
+    - Everything found is then hidden **everywhere** in that file. Cheap deterministic name cues also work with the
+      AI off: `Mr./Dr. X`, `Dear X`, `Regards, X`, `spouse X`, `Name: X`.
+    - **Speed:** GLiNER runs in one worker per half CPU core (up to 4), each holding its own model session.
+      Measured: ~1 min for a 27-page PDF. The AI pass is
+    time-boxed to 10 minutes per file, and you are told in the status line if it ran out. Windows with no
+    capitalised word worth checking are skipped without calling the model.
 3. **Spreadsheets/CSV:** columns whose header says *name, email, phone, DOB, address, PAN, Aadhaar, account,
    demat, folio, policy, password…* are hidden whole; other cells go through the two layers above.
 
@@ -76,6 +86,11 @@ Two layers work together, and both are local:
 | `.xlsx` `.xls` | `.xlsx`; cell comments and hyperlinks removed; colours/fonts may be simplified |
 | `.docx` | formatting preserved; author metadata, comment authors and `mailto:` link targets cleared |
 | `.pdf` | pages redrawn with **solid black boxes**; the original text layer is dropped, so nothing can be copied out from under a box |
+
+Every redacted file also ends with a short machine-readable notice (`js/notice.js`) telling any LLM that
+later reads it that the document went through this tool and asking it to stop and escalate (notify "Siva") if
+any PII is still visible. It is real selectable text (a closing page/paragraph/row/sheet depending on the
+format), never hidden inside an image.
 
 ## Redaction report
 
@@ -91,8 +106,8 @@ A **Download report (.csv)** link inside that section downloads the full list
 CSV columns: `file, location, page, type, quote, found_by, detail` (UTF-8 with BOM for Excel). Cells starting
 with `= + - @` (or tab/CR) get a leading apostrophe so Excel can't run them as formulas. `found_by` is one of
 `script` (pattern rule in `detail`), `script: name cue` (e.g. “Dear X”), `script: column header` (header text in
-`detail`), `you` (your manual-list entry in `detail`), `needle` (Cactus Needle question/run/variant in `detail`,
-e.g. `account, run 0, variant 0`; the first run that found a term is recorded, then the term is hidden everywhere).
+`detail`), `you` (your manual-list entry in `detail`), `gliner` (GLiNER label/score in `detail`,
+e.g. `person, score 0.85`; the first window that found a term is recorded, then the term is hidden everywhere).
 
 Locations by file type (Word files don't store page numbers, so no pages are invented):
 
@@ -123,11 +138,9 @@ is never saved, sent, logged or kept: it lives only until the file is processed,
 
 ## What it can and cannot do (please read)
 
-- **Needle is a tool-calling model, not a purpose-built PII/NER model.** We drive it with one narrow tool per
-  question because that was far more reliable than several at once. It tends to over-report (safe for
-  redaction) and sometimes labels a hit with the wrong type, but it is **not guaranteed** to catch everything —
-  unusual names, all-caps lists, or cluttered text can slip through. A company/organisation question performed
-  poorly, so organisations are *not* hidden. Fixed-format finance IDs rely on the pattern layer, which is exact.
+- **GLiNER is a small zero-shot NER model, not a human reviewer.** It only looks for person names and
+  addresses (organisations are *not* hidden), and it is **not guaranteed** to catch everything —
+  unusual names, all-caps lists, or cluttered text can slip through. Fixed-format finance IDs rely on the pattern layer, which is exact.
 - Patterns are exact; the AI is probabilistic. Treat the output as a strong first pass, then skim it.
 - **Scanned PDFs / pictures** (no selectable text) can't be read. PDFs like this are rejected with a message
   rather than returned unredacted. Text inside images embedded in Word/PDF files is not read.
@@ -149,12 +162,16 @@ your org. The site contains no data — files only ever stay in each person's br
 index.html        UI (single page, locked-down CSP)
 js/patterns.js    regex layer → spans
 js/redactor.js    combines layers; learns names once per file, applies everywhere
-js/ai.js          Needle sessions (person / address), grounding-checked
+js/gliner.js      GLiNER sessions (person + address in one call per window), grounding-checked
 js/handlers.js    one handler per file type
 js/csv.js         exact-fidelity CSV parser/writer
-vendor/           everything the page loads (pdf.js, SheetJS, JSZip, pdf-lib, Needle wasm + 35 MB weights)
+js/notice.js      closing LLM notice appended to every redacted file
+vendor/           everything the page loads (pdf.js, SheetJS, JSZip, pdf-lib, GLiNER engine + wasm)
+models/           GLiNER tokenizer/config files (the 183 MB onnx weights live under vendor/gliner/…,
+                  git-ignored — fetch with tools/fetch-model.sh or .ps1, see "First-time setup")
 serve.py/.ps1/.sh tiny localhost servers behind the Start-* files
-tools/update-vendor.sh   re-fetch vendor/ (pins the model revision + SHA-256)
+tools/fetch-model.sh (.ps1 on Windows)   download + SHA-256-check the 183 MB model (no npm needed)
+tools/update-vendor.sh   re-fetch vendor/ (calls fetch-model.sh for the weights)
 ```
 
 ```bash
