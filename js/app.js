@@ -15,6 +15,21 @@ const ONLY_UNLOCK = false;
 
 window.__appLoaded = true;
 const $ = (id) => document.getElementById(id);
+
+// WHY here (the page's main module): register the offline asset cache so the
+// 83 MB GLiNER weights, the ONNX wasm and the Tesseract files download once
+// per browser and are kept on the device (Cache Storage survives refreshes
+// where the HTTP cache refuses these files). Guarded to http(s) so the
+// file:// guidance in js/guard.js keeps working; any failure only warns and
+// the app runs exactly as before without the cache.
+if ("serviceWorker" in navigator && /^https?:$/.test(location.protocol)) {
+  navigator.serviceWorker.register("sw.js", { type: "module" }).catch((err) => console.warn("offline cache unavailable:", err));
+  try {
+    navigator.storage?.persist?.()?.catch?.(() => {});
+  } catch {
+    /* persistent-storage request is best-effort */
+  }
+}
 // js/guard.js may have shown a "browser can't start" message if loading was slow.
 $("banner").hidden = true;
 

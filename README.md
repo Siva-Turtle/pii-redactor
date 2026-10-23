@@ -48,6 +48,21 @@ run the same check automatically when the model is missing, and stay offline
 once it is there. Without the model the app still works but only the pattern
 checks run, and it tells you so.
 
+## Offline storage (first visit downloads, then kept on the device)
+
+The heavy offline files — the 83 MB GLiNER model (`vendor/gliner/…`),
+the ONNX runtime wasm (`vendor/gliner/`) and the Tesseract OCR files
+(`vendor/tesseract/`) — download once on the first visit and are then kept
+permanently on the device by a service worker (`sw.js`, Cache Storage), so
+refreshes and new sessions reuse them without downloading again. App code
+(`index.html`, `js/`) is never cached, so updates always load fresh. Your
+documents are never cached or stored — only these same app asset files are.
+
+To clear the stored files: use your browser's site-data controls for this
+site (e.g. Chrome: lock icon → Site settings → Delete data; Firefox:
+padlock → Clear cookies and site data). The files download again on the
+next visit.
+
 > **Always glance over the result before sharing it.** No automatic tool catches everything — see
 > "What it can and cannot do".
 

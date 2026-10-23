@@ -1387,4 +1387,30 @@ assert.strictEqual(cleanHit("Dr Priya Nair."), "Priya Nair");
   await assert.rejects(() => startWorkerPool(2, async () => { throw new Error("boom"); }), /boom/);
   assert.deepStrictEqual(await startWorkerPool(1, async () => "solo"), ["solo"]);
 }
+// --- offline asset cache decision (js/asset-cache.js) ---
+{
+  const { shouldCache } = await import("../js/asset-cache.js");
+  const S = "http://localhost:8731/";
+  const H = (v) => (typeof Headers !== "undefined" ? new Headers(v) : v);
+  // heavy blobs are cached
+  assert.strictEqual(shouldCache(`${S}vendor/gliner/models/knowledgator/gliner-pii-small-v1.0/onnx/model_quint8.onnx`, "GET", null, S), true, "gliner model cached");
+  assert.strictEqual(shouldCache(`${S}vendor/gliner/ort-wasm-simd-threaded.wasm`, "GET", null, S), true, "onnx wasm cached");
+  assert.strictEqual(shouldCache(`${S}vendor/tesseract/eng.traineddata`, "GET", null, S), true, "tesseract data cached");
+  assert.strictEqual(shouldCache(`${S}models/tokenizer.json`, "GET", null, S), true, "models/ cached");
+  // app code is never cached (stays fresh)
+  assert.strictEqual(shouldCache(`${S}js/app.js`, "GET", null, S), false, "js/ bypassed");
+  assert.strictEqual(shouldCache(`${S}index.html`, "GET", null, S), false, "index bypassed");
+  assert.strictEqual(shouldCache(S, "GET", null, S), false, "root bypassed");
+  // probes bypass so modelMissing() keeps working
+  assert.strictEqual(shouldCache(`${S}vendor/gliner/models/x/onnx/model_quint8.onnx`, "HEAD", null, S), false, "HEAD bypassed");
+  assert.strictEqual(shouldCache(`${S}vendor/tesseract/eng.traineddata`, "GET", H({ range: "bytes=0-0" }), S), false, "Range bypassed");
+  // other origins bypass
+  assert.strictEqual(shouldCache("https://huggingface.co/vendor/x.bin", "GET", null, S), false, "other-origin bypassed");
+  // sub-path scope: assets resolve under the scope, outside paths bypass
+  const SUB = "http://localhost:8731/sub/";
+  assert.strictEqual(shouldCache(`${SUB}vendor/gliner/x.onnx`, "GET", null, SUB), true, "sub-path vendor cached");
+  assert.strictEqual(shouldCache(`${SUB}models/a.json`, "GET", null, SUB), true, "sub-path models cached");
+  assert.strictEqual(shouldCache(`${SUB}js/app.js`, "GET", null, SUB), false, "sub-path js bypassed");
+  assert.strictEqual(shouldCache("http://localhost:8731/vendor/x.onnx", "GET", null, SUB), false, "outside scope bypassed");
+}
 console.log("All unit tests passed.");

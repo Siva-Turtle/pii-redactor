@@ -89,6 +89,7 @@ Applied before anything is hidden. These are what keep false alarms down.
 | LLM notice | Adds a notice to each output telling an AI reader to stop and flag any PII it finds. | `js/notice.js` |
 | Report | A CSV listing what was hidden, its type and which layer found it. | `buildReportCsv` |
 | file:// guard | If `index.html` is double-clicked instead of served, shows how to start the app. | `js/guard.js` |
+| Offline storage | A service worker (`sw.js`, decision in `js/asset-cache.js`) keeps the heavy `vendor/` + `models/` blobs (GLiNER weights, ONNX wasm, Tesseract files) in Cache Storage after the first visit, with a background conditional revalidation; app code and user documents are never cached. | `sw.js`, `js/asset-cache.js` |
 
 ## Security boundary
 
