@@ -1364,4 +1364,27 @@ assert.strictEqual(cleanHit("Dr Priya Nair."), "Priya Nair");
     assert.ok(!r.apply(doc).includes("Registered Office Lane"), "real address hides");
   }
 }
+// --- GLiNER pool start: one worker warms the HTTP cache, extras tolerate failure ---
+{
+  const { startWorkerPool } = await import("../js/gliner.js");
+  // WHY: parallel cold starts fetch the same 83 MB model and fail with
+  // ERR_CACHE_WRITE_FAILURE; the pool must start one worker first, then the rest.
+  {
+    const order = [];
+    let n = 0;
+    const pool = await startWorkerPool(4, async () => {
+      n++;
+      const me = n;
+      order.push(`start-${me}`);
+      if (me > 1) assert.ok(order.includes("ready-1"), "extras start only after the first worker is ready");
+      if (me === 3) throw new Error("Failed to fetch");
+      order.push(`ready-${me}`);
+      return `w${me}`;
+    });
+    assert.deepStrictEqual(pool, ["w1", "w2", "w4"], "worker 3 of 4 fails -> pool size 3");
+  }
+  // the first failure still aborts so loadGliner can report a missing model
+  await assert.rejects(() => startWorkerPool(2, async () => { throw new Error("boom"); }), /boom/);
+  assert.deepStrictEqual(await startWorkerPool(1, async () => "solo"), ["solo"]);
+}
 console.log("All unit tests passed.");

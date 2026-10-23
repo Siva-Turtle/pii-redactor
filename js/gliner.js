@@ -31,22 +31,39 @@ async function modelMissing() {
   }
 }
 
+// WHY one worker first: each worker fetches the same 83 MB model file, and
+  // starting them all at once makes parallel range/cache writes fail on static
+  // hosts (net::ERR_CACHE_WRITE_FAILURE). The first "ready" warms the HTTP
+  // cache, then the rest can start together. Extra workers may still fail, so
+  // they are tolerated; only the first failure aborts (modelMissing check).
+export async function startWorkerPool(size, createWorker) {
+  const first = await createWorker();
+  if (size <= 1) return [first];
+  const rest = await Promise.allSettled(Array.from({ length: size - 1 }, () => createWorker()));
+  const workers = [first];
+  for (const r of rest) if (r.status === "fulfilled") workers.push(r.value);
+  return workers;
+}
+
 export async function loadGliner() {
   const q = Number(new URLSearchParams(location.search).get("w"));
   // WHY half the cores (max 4): each worker holds a full model session, so
   // more workers cost memory without speeding up beyond this point (measured).
   // `?w=N` is a benchmark override, not part of the UI.
   const size = q > 0 ? q : Math.max(1, Math.min(4, Math.floor((navigator.hardwareConcurrency || 4) / 2)));
+  const spawn = () => new Promise((resolve, reject) => {
+    const w = new Worker(new URL("./gliner-worker.js", import.meta.url), { type: "module" });
+    const fail = (err) => {
+      try { w.terminate(); } catch { /* ignore */ }
+      reject(err);
+    };
+    w.onmessage = ({ data }) => (data.type === "ready" ? resolve(w) : fail(new Error(data.message)));
+    w.onerror = (e) => fail(new Error(e.message || "worker failed"));
+    w.postMessage({ type: "init" });
+  });
   let workers;
   try {
-    workers = await Promise.all(
-      Array.from({ length: size }, () => new Promise((resolve, reject) => {
-        const w = new Worker(new URL("./gliner-worker.js", import.meta.url), { type: "module" });
-        w.onmessage = ({ data }) => (data.type === "ready" ? resolve(w) : reject(new Error(data.message)));
-        w.onerror = (e) => reject(new Error(e.message || "worker failed"));
-        w.postMessage({ type: "init" });
-      })),
-    );
+    workers = await startWorkerPool(size, spawn);
   } catch (err) {
     if (await modelMissing()) throw new Error(MODEL_MISSING_MSG);
     throw err;
@@ -57,7 +74,7 @@ export async function loadGliner() {
   const acquire = () => (idle.length ? Promise.resolve(idle.pop()) : new Promise((r) => waiting.push(r)));
   const release = (w) => (waiting.length ? waiting.shift()(w) : idle.push(w));
   return {
-    size,
+    size: workers.length,
     async recognize(text, threshold = 0.4) {
       const w = await acquire();
       const id = nextId++;
